@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { useGlobalState } from "../context/GlobalContext";
 import ErrorBoundary from "./ErrorBoundary";
 import { db, complaintsCollection, techniciansCollection, inventoryCollection } from '../lib/firebase';
+import { onSnapshot, updateDoc, doc } from 'firebase/firestore';
 
 import { Complaint, Technician, InventoryItem } from '../types';
 import { LogOut, Check, Camera, Wrench, Search, Package, FileText, Download, MapPin, MessageCircle, ScanLine, Clock, PlayCircle, Square, Briefcase, Calendar } from 'lucide-react';
@@ -97,14 +98,34 @@ function InnerTechnicianDashboard() {
         }
       });
       
-      const compRef = ref(rtdb, 'complaints');
-      const unsubComp = onValue(compRef, (snapshot) => {
-        if (snapshot.exists()) {
-          const val = snapshot.val();
-          const rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] }));
-          setComplaints(rtdbData.filter((c: any) => c.assignedTechnicianId === tech.id));
+      // 1. Cloud Firestore listener for technician's assigned tasks
+      const unsubFsComp = onSnapshot(complaintsCollection, (snapshot) => {
+        if (!snapshot.empty) {
+          const fsData = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+          const myTasks = fsData.filter((c: any) => c.assignedTechnicianId === tech.id);
+          setComplaints(prev => {
+            const merged = [...myTasks, ...prev.filter(p => !myTasks.some(m => m.id === p.id))];
+            return merged.sort((a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+          });
         }
-      });
+      }, () => {});
+
+      // 2. Also listen to RTDB if active
+      let unsubComp = () => {};
+      try {
+        const compRef = ref(rtdb, 'complaints');
+        unsubComp = onValue(compRef, (snapshot) => {
+          if (snapshot.exists()) {
+            const val = snapshot.val();
+            const rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] }));
+            const rtdbTasks = rtdbData.filter((c: any) => c.assignedTechnicianId === tech.id);
+            setComplaints(prev => {
+              const merged = [...rtdbTasks, ...prev];
+              return [...new Map(merged.map(item => [item.id, item])).values()].sort((a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+            });
+          }
+        }, () => {});
+      } catch(e) {}
       
       const invRef = ref(rtdb, 'inventory');
       const unsubInv = onValue(invRef, (snapshot) => {
@@ -389,11 +410,13 @@ function InnerTechnicianDashboard() {
     if (!remarkingComplaintId) return;
 
     try {
-      await update(ref(rtdb, 'complaints/' + remarkingComplaintId), {
+      const remarkData = {
         technicianRemark: technicianRemark,
         status: remarkStatus,
         updatedAt: new Date().toISOString()
-      });
+      };
+      updateDoc(doc(db, 'complaints', remarkingComplaintId), remarkData).catch(() => {});
+      update(ref(rtdb, 'complaints/' + remarkingComplaintId), remarkData).catch(() => {});
       setRemarkModalOpen(false);
       setRemarkingComplaintId(null);
       setTechnicianRemark('');
@@ -410,8 +433,7 @@ function InnerTechnicianDashboard() {
 
     try {
       const sanitizedPartName = DOMPurify.sanitize(replacedPartName);
-      const complaintRef = ref(rtdb, 'complaints/' + resolvingComplaintId);
-      await update(complaintRef, {
+      const resolveData = {
         status: 'COMPLETED',
         resolutionDetails: {
           replacedPartName: sanitizedPartName,
@@ -429,7 +451,11 @@ function InnerTechnicianDashboard() {
             paymentScreenshotUrl
           })
         }
-      });
+      };
+
+      updateDoc(doc(db, 'complaints', resolvingComplaintId), resolveData).catch(() => {});
+      const complaintRef = ref(rtdb, 'complaints/' + resolvingComplaintId);
+      update(complaintRef, resolveData).catch(() => {});
       
       setResolutionModalOpen(false);
       setResolvingComplaintId(null);

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { ref, onValue } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
+import { rtdb, db, complaintsCollection } from '../lib/firebase';
+import { collection, onSnapshot } from 'firebase/firestore';
 import { Complaint, Technician } from '../types';
 import { Search, Phone, Wrench, CheckCircle2, Clock, AlertCircle, User, MessageCircle, FileText, ChevronRight, Calendar, MapPin, Sparkles } from 'lucide-react';
 import { generateInvoice } from '../utils/generateInvoice';
@@ -12,32 +13,74 @@ export default function TrackComplaint() {
   const [technicians, setTechnicians] = useState<Technician[]>([]);
   const [selectedComplaint, setSelectedComplaint] = useState<Complaint | null>(null);
 
-  // Sync technicians for contact details
+  // Sync technicians for contact details from Firestore & RTDB
   useEffect(() => {
-    const techRef = ref(rtdb, 'technicians');
-    const unsubTech = onValue(techRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const techList = Object.keys(val).map(k => ({ id: k, ...val[k] }));
-        setTechnicians(techList);
+    const unsubFirestoreTech = onSnapshot(collection(db, 'technicians'), (snapshot) => {
+      if (!snapshot.empty) {
+        const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as Technician[];
+        setTechnicians(prev => {
+          const merged = [...list, ...prev];
+          return [...new Map(merged.map(item => [item.id, item])).values()];
+        });
       }
-    });
-    return () => unsubTech();
+    }, () => {});
+
+    let unsubTech = () => {};
+    try {
+      const techRef = ref(rtdb, 'technicians');
+      unsubTech = onValue(techRef, (snapshot) => {
+        if (snapshot.exists()) {
+          const val = snapshot.val();
+          const techList = Object.keys(val).map(k => ({ id: k, ...val[k] }));
+          setTechnicians(prev => {
+            const merged = [...prev, ...techList];
+            return [...new Map(merged.map(item => [item.id, item])).values()];
+          });
+        }
+      }, () => {});
+    } catch (e) {}
+
+    return () => {
+      unsubFirestoreTech();
+      unsubTech();
+    };
   }, []);
 
-  // Sync complaints in real-time
+  // Sync complaints in real-time from Cloud Firestore
   useEffect(() => {
-    const compRef = ref(rtdb, 'complaints');
-    const unsub = onValue(compRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const list = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
-        setComplaints(list);
-      } else {
-        setComplaints([]);
+    // 1. Cloud Firestore listener
+    const unsubFs = onSnapshot(complaintsCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Complaint[];
+        setComplaints(prev => {
+          const merged = [...list, ...prev];
+          return [...new Map(merged.map(item => [item.id, item])).values()];
+        });
       }
+    }, (err) => {
+      console.warn("Firestore complaints listener note:", err?.message || err);
     });
-    return () => unsub();
+
+    // 2. RTDB listener (if active)
+    let unsubRtdb = () => {};
+    try {
+      const compRef = ref(rtdb, 'complaints');
+      unsubRtdb = onValue(compRef, (snapshot) => {
+        if (snapshot.exists()) {
+          const val = snapshot.val();
+          const list = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
+          setComplaints(prev => {
+            const merged = [...prev, ...list];
+            return [...new Map(merged.map(item => [item.id, item])).values()];
+          });
+        }
+      }, () => {});
+    } catch (e) {}
+
+    return () => {
+      unsubFs();
+      unsubRtdb();
+    };
   }, []);
 
   const handleSearch = (e: React.FormEvent) => {

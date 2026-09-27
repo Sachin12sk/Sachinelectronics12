@@ -34,3 +34,4 @@ export const technicianApplicationsCollection = collection(db, 'technicianApplic
 
 export const areaAdminsCollection = collection(db, 'areaAdmins');
 export const loyaltyCollection = collection(db, 'loyalty');
+export const ordersCollection = collection(db, 'orders');

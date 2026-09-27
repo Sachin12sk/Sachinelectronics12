@@ -5,6 +5,7 @@ import { MessageSquare, X, Send, User, Bot, Loader2, Camera } from 'lucide-react
 import { motion, AnimatePresence } from 'motion/react';
 
 import { complaintsCollection } from '../lib/firebase';
+import { addDoc } from 'firebase/firestore';
 import VoiceInput from './VoiceInput';
 import { isPromptInjection, isValidFile } from '../lib/security';
 
@@ -125,13 +126,15 @@ export default function LiveChat() {
           createdAt: new Date().toISOString()
         };
         
-        push(ref(rtdb, 'complaints'), newComplaint).then(docRef => {
+        addDoc(complaintsCollection, newComplaint).then(docRef => {
           setBookingCompleted({
             ...newComplaint,
-            id: docRef.key
+            id: docRef.id
           });
+          // Background sync to RTDB if active
+          try { push(ref(rtdb, 'complaints'), newComplaint).catch(() => {}); } catch(e) {}
         }).catch(dbError => {
-          console.error("Error saving booking:", dbError);
+          console.error("Error saving booking to Firestore:", dbError);
           setBookingCompleted({
             ...newComplaint,
             id: 'REQ-' + Math.floor(Math.random() * 100000)
@@ -201,11 +204,12 @@ export default function LiveChat() {
         };
         
         try {
-          const docRef = await push(ref(rtdb, 'complaints'), newComplaint);
+          const docRef = await addDoc(complaintsCollection, newComplaint);
           setBookingCompleted({
             ...newComplaint,
-            id: docRef.key
+            id: docRef.id
           });
+          try { push(ref(rtdb, 'complaints'), newComplaint).catch(() => {}); } catch(e) {}
         } catch (dbError) {
           console.error("Error saving booking:", dbError);
         }

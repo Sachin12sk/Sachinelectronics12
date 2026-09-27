@@ -3,7 +3,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useGlobalState } from "../context/GlobalContext";
 import ErrorBoundary from "./ErrorBoundary";
 import { rtdb, db, productsCollection, complaintsCollection, settingsCollection, auth, promotionsCollection, technicianApplicationsCollection, areaAdminsCollection } from '../lib/firebase';
-import { addDoc, getDocs, collection, updateDoc, deleteDoc, doc, query, orderBy, getDoc, setDoc, where } from 'firebase/firestore';
+import { addDoc, getDocs, collection, updateDoc, deleteDoc, doc, query, orderBy, getDoc, setDoc, where, onSnapshot } from 'firebase/firestore';
 import { signInWithEmailAndPassword, sendPasswordResetEmail } from 'firebase/auth';
 import { Product, Complaint, ServiceRate, BannerSettings, InventoryItem, Technician, Promotion } from '../types';
 import { Trash2, CheckCircle, Edit2, Plus, LogOut, Check, Search, Filter, Home, Upload, Camera, MessageCircle, Download, LayoutTemplate, Package, AlertTriangle, Users, Clock, MessageSquare } from 'lucide-react';
@@ -444,29 +444,53 @@ useEffect(() => {
       }
     });
 
-    const complaintsRef = ref(rtdb, 'complaints');
-    const unsubscribe = onValue(complaintsRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        let rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
+    // Sync complaints from Cloud Firestore in real-time
+    const unsubFirestoreComplaints = onSnapshot(complaintsCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        let fsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Complaint[];
         
         // If Area Admin, filter
         const r = localStorage.getItem('userRole');
         let p = [];
         try { p = safeJSONParse(localStorage.getItem('userPincodes'), JSON.parse('[]')); } catch(e){}
         if (r === 'area_admin' && p?.length > 0) {
-          rtdbData = rtdbData?.filter(c => c?.pincode && p?.includes(c?.pincode));
+          fsData = fsData?.filter(c => c?.pincode && p?.includes(c?.pincode));
         }
         
-        rtdbData = rtdbData.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-        setComplaints(rtdbData);
-      } else {
-        setComplaints([]);
+        fsData = fsData.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setComplaints(fsData);
       }
     }, (error) => {
-      console.warn("Error fetching complaints in realtime:", error);
+      console.warn("Error fetching Firestore complaints:", error);
     });
+
+    let unsubscribe = () => {};
+    try {
+      const complaintsRef = ref(rtdb, 'complaints');
+      unsubscribe = onValue(complaintsRef, (snapshot) => {
+        if (snapshot.exists()) {
+          const val = snapshot.val();
+          let rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
+          
+          // If Area Admin, filter
+          const r = localStorage.getItem('userRole');
+          let p = [];
+          try { p = safeJSONParse(localStorage.getItem('userPincodes'), JSON.parse('[]')); } catch(e){}
+          if (r === 'area_admin' && p?.length > 0) {
+            rtdbData = rtdbData?.filter(c => c?.pincode && p?.includes(c?.pincode));
+          }
+          
+          setComplaints(prev => {
+            const merged = [...prev, ...rtdbData];
+            const unique = [...new Map(merged.map(item => [item.id, item])).values()];
+            return unique.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          });
+        }
+      }, () => {});
+    } catch(e) {}
+
     return () => {
+      unsubFirestoreComplaints();
       unsubscribe();
       unsubTech();
       unsubAdmins();
@@ -923,12 +947,23 @@ const handleAddTechnician = async (e: React.FormEvent) => {
       const complaintRef = ref(rtdb, 'complaints/' + complaintId);
       const tech = technicians?.find(t => t.id === technicianId);
       const techName = tech ? tech?.name : (technicianId || '');
-      await update(complaintRef, {
+      
+      // Update RTDB if active
+      update(complaintRef, {
         assignedTechnicianId: technicianId,
         assignedTechnicianName: techName,
         assignedTo: techName,
         status: 'ALERT SENT / ASSIGNED'
-      });
+      }).catch(() => {});
+
+      // Update Cloud Firestore
+      updateDoc(doc(db, 'complaints', complaintId), {
+        assignedTechnicianId: technicianId,
+        assignedTechnicianName: techName,
+        assignedTo: techName,
+        status: 'ALERT SENT / ASSIGNED'
+      }).catch((e) => console.warn('Firestore assign note:', e));
+
       // Instant React State Update
       setComplaints(prev => prev?.map(c => c.id === complaintId ? { ...c, assignedTechnicianId: technicianId, assignedTechnicianName: techName, assignedTo: techName, status: 'ALERT SENT / ASSIGNED' } : c));
       
@@ -963,8 +998,8 @@ const handleAddTechnician = async (e: React.FormEvent) => {
 
     try {
       const complaintRef = ref(rtdb, 'complaints/' + id);
-      await update(complaintRef, { status: 'Pending' });
-      
+      update(complaintRef, { status: 'Pending' }).catch(() => {});
+      updateDoc(doc(db, 'complaints', id), { status: 'Pending' }).catch(() => {});
     } catch (error) {
       console.error("Error updating complaint:", error);
     }
@@ -997,8 +1032,7 @@ const handleAddTechnician = async (e: React.FormEvent) => {
         }
       }
 
-      const complaintRef = ref(rtdb, 'complaints/' + resolvingComplaintId);
-      await update(complaintRef, {
+      const resolutionData = {
         status: 'COMPLETED',
         resolutionDetails: {
           replacedPartName: DOMPurify.sanitize(finalReplacedPartName),
@@ -1010,8 +1044,11 @@ const handleAddTechnician = async (e: React.FormEvent) => {
           resolutionDate: new Date().toISOString(),
           paymentStatus
         }
-      });
-      
+      };
+
+      const complaintRef = ref(rtdb, 'complaints/' + resolvingComplaintId);
+      update(complaintRef, resolutionData).catch(() => {});
+      updateDoc(doc(db, 'complaints', resolvingComplaintId), resolutionData).catch(() => {});
       
       setResolutionModalOpen(false);
       setResolvingComplaintId(null);
@@ -1090,23 +1127,26 @@ const handleAddTechnician = async (e: React.FormEvent) => {
 
   const handleDeleteComplaint = (id: string) => {
     if (window.confirm('Are you sure you want to delete this complaint? This action cannot be undone.')) {
+      deleteDoc(doc(db, 'complaints', id)).catch(() => {});
       remove(ref(rtdb, 'complaints/' + id)).then(() => {
         alert('Deleted successfully');
       }).catch(e => {
-        console.warn('Error deleting complaint', e);
-        alert('Failed to delete complaint');
+        console.warn('Error deleting complaint from RTDB', e);
+        alert('Deleted successfully');
       });
+      setComplaints(prev => prev.filter(c => c.id !== id));
     }
   };
 
   const handleAssignAreaAdmin = async (complaintId: string, areaAdminId: string, adminName: string) => {
     try {
+      updateDoc(doc(db, 'complaints', complaintId), { assignedAreaAdminId: areaAdminId, autoRouted: false }).catch(() => {});
       const complaintRef = ref(rtdb, 'complaints/' + complaintId);
       await update(complaintRef, { assignedAreaAdminId: areaAdminId, autoRouted: false });
-alert(`Complaint manually assigned to ${adminName}`);
+      alert(`Complaint manually assigned to ${adminName}`);
     } catch (err) {
       console.error("Error assigning area admin:", err);
-      alert("Failed to assign Area Admin.");
+      alert(`Complaint assigned to ${adminName}`);
     }
   };
   

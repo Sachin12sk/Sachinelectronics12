@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { CheckCircle2, AlertCircle, Search, Clock, Wrench, Download, ImagePlus, X, Camera, MapPin, Navigation } from 'lucide-react';
 import { motion } from 'motion/react';
 import { rtdb, complaintsCollection, settingsCollection, db, areaAdminsCollection, loyaltyCollection } from '../lib/firebase';
+import { collection, addDoc, doc, getDoc, getDocs, query, where, onSnapshot } from 'firebase/firestore';
 
 import { Complaint, ServiceRate } from '../types';
 import { generateInvoice } from '../utils/generateInvoice';
@@ -21,6 +22,8 @@ export default function ComplaintForm() {
   const [activeTab, setActiveTab] = useState<'book' | 'track'>('book');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [successJobId, setSuccessJobId] = useState<string>('');
   const [issueText, setIssueText] = useState('');
   const [customProduct, setCustomProduct] = useState('');
   const [selectedProduct, setSelectedProduct] = useState('');
@@ -48,23 +51,46 @@ export default function ComplaintForm() {
 
   
   useEffect(() => {
-    const unsubPricing = onValue(ref(rtdb, 'settings/pricing'), (snapshot) => {
-      if (snapshot.exists()) {
-        const data = snapshot.val();
-        setPricing(prev => ({ ...prev, ...data, serviceFees: { ...prev.serviceFees, ...(data.serviceFees || {}) } }));
+    // 1. Listen to pricing from Cloud Firestore (primary)
+    const unsubFirestorePricing = onSnapshot(doc(db, 'settings', 'pricing'), (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        setPricing(prev => ({
+          ...prev,
+          ...data,
+          serviceFees: { ...prev.serviceFees, ...(data.serviceFees || {}) }
+        }));
       }
+    }, (err) => {
+      console.warn("Firestore pricing sync note:", err?.message || err);
     });
 
-    const unsubServiceRates = onValue(ref(rtdb, 'serviceRates'), (snapshot) => {
-      if (snapshot.exists()) {
-        const data = snapshot.val();
-        setServiceRates(Object.keys(data).map(key => ({ id: key, ...data[key] })));
-      } else {
-        setServiceRates([]);
-      }
-    });
+    // 2. Also listen to RTDB pricing as secondary
+    let unsubPricing = () => {};
+    try {
+      unsubPricing = onValue(ref(rtdb, 'settings/pricing'), (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.val();
+          setPricing(prev => ({ ...prev, ...data, serviceFees: { ...prev.serviceFees, ...(data.serviceFees || {}) } }));
+        }
+      }, () => {});
+    } catch (e) {}
+
+    // 3. Service rates from RTDB or fallback
+    let unsubServiceRates = () => {};
+    try {
+      unsubServiceRates = onValue(ref(rtdb, 'serviceRates'), (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.val();
+          setServiceRates(Object.keys(data).map(key => ({ id: key, ...data[key] })));
+        } else {
+          setServiceRates([]);
+        }
+      }, () => {});
+    } catch (e) {}
 
     return () => {
+      unsubFirestorePricing();
       unsubPricing();
       unsubServiceRates();
     };
@@ -85,26 +111,39 @@ export default function ComplaintForm() {
     });
   };
 
-    const checkLoyalty = async (phoneNumber: string) => {
+  const checkLoyalty = async (phoneNumber: string) => {
     try {
-      
-      const snap = await get(ref(rtdb, 'loyalty'));
-      let loyaltyData = null;
-      if (snap.exists()) {
-         const allLoyalty = snap.val();
-         const match = Object.keys(allLoyalty).find(k => allLoyalty[k].phone === phoneNumber);
-         if (match) loyaltyData = allLoyalty[match];
+      const cleanPhone = phoneNumber.replace(/[^0-9]/g, '');
+      // 1. Try Cloud Firestore loyalty collection
+      try {
+        const q = query(collection(db, 'loyalty'), where('phone', '==', cleanPhone));
+        const snap = await getDocs(q);
+        if (!snap.empty) {
+          const docData = snap.docs[0].data() as any;
+          setLoyaltyCoins(docData.coins || 0);
+          return;
+        }
+      } catch (fsErr) {
+        console.warn("Firestore loyalty lookup note:", fsErr);
       }
-      const pseudoSnap = { empty: !loyaltyData, docs: loyaltyData ? [{ data: () => loyaltyData }] : [] };
-      const snapObj = pseudoSnap;
-    
-      if (!snapObj.empty) {
-        setLoyaltyCoins(snapObj.docs[0].data().coins || 0);
-      } else {
-        setLoyaltyCoins(0);
-      }
+
+      // 2. Fallback to RTDB
+      try {
+        const snap = await get(ref(rtdb, 'loyalty'));
+        if (snap.exists()) {
+          const allLoyalty = snap.val();
+          const matchKey = Object.keys(allLoyalty).find(k => allLoyalty[k].phone === cleanPhone || allLoyalty[k].phone === phoneNumber);
+          if (matchKey) {
+            setLoyaltyCoins(allLoyalty[matchKey].coins || 0);
+            return;
+          }
+        }
+      } catch (e) {}
+
+      setLoyaltyCoins(0);
     } catch (e) {
-      console.error("Failed to check loyalty", e);
+      console.warn("Failed to check loyalty", e);
+      setLoyaltyCoins(0);
     }
   };
 
@@ -128,39 +167,64 @@ export default function ComplaintForm() {
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    setErrorMessage(null);
     setIsSubmitting(true);
-    const formData = new FormData(e.currentTarget);
-    const name = formData.get('name') as string;
-    const phoneInput = formData.get('phone') as string;
-    const pincode = formData.get('pincode') as string;
-    const addressInput = formData.get('address') as string;
+
+    const formElement = e.currentTarget;
+    const formData = new FormData(formElement);
+    const name = (formData.get('name') as string || '').trim();
+    const phoneInput = (formData.get('phone') as string || '').trim();
+    const pincode = (formData.get('pincode') as string || '').trim();
+    const addressInput = (formData.get('address') as string || '').trim();
+
+    // Frontend validation check
+    if (!name || !phoneInput || !addressInput) {
+      setErrorMessage('Please fill in all required fields (Name, Phone number, and Address).');
+      setIsSubmitting(false);
+      return;
+    }
+
     let finalPincode = pincode || '000000';
     const pinMatch = addressInput.match(/\b\d{6}\b/) || pincode.match(/\b\d{6}\b/);
     if (pinMatch) finalPincode = pinMatch[0];
 
     const baseProduct = formData.get('product') as string;
-    const product = baseProduct === 'Other' ? formData.get('customProduct') as string : baseProduct;
-    const issue = formData.get('issue') as string;
-    const priority = formData.get('priority') as 'Normal' | 'Urgent';
-    const timeslot = formData.get('timeslot') as string;
+    const product = baseProduct === 'Other' ? ((formData.get('customProduct') as string) || 'Other') : baseProduct;
+    const issue = (formData.get('issue') as string || '').trim();
+    const priority = (formData.get('priority') as 'Normal' | 'Urgent') || 'Normal';
+    const timeslot = (formData.get('timeslot') as string) || 'Morning 10-12 AM';
 
     try {
-      let assignedAreaAdminId = null;
+      let assignedAreaAdminId: string | null = null;
+      let adminPhone = "918381892161";
+
+      // 1. Fetch Area Admins from Cloud Firestore with 3s timeout
       try {
-        const snapshot = await get(ref(rtdb, 'areaAdmins'));
-        if (snapshot.exists()) {
-          const admins = Object.keys(snapshot.val()).map(k => snapshot.val()[k]);
+        const areaAdminsPromise = getDocs(collection(db, 'areaAdmins'));
+        const timeoutAdmins = new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000));
+        const snapshot = await Promise.race([areaAdminsPromise, timeoutAdmins]) as any;
+        if (snapshot && !snapshot.empty) {
+          const admins = snapshot.docs.map((d: any) => ({ id: d.id, ...d.data() }));
           const localMatch = admins.find((a: any) => a.pincodes && a.pincodes.includes(finalPincode) && a.isActive);
-          if (localMatch) assignedAreaAdminId = localMatch.id;
+          if (localMatch) {
+            assignedAreaAdminId = localMatch.id;
+            if (localMatch.phone) {
+              let clean = String(localMatch.phone).replace(/[^0-9]/g, '');
+              if (clean.length === 10) clean = "91" + clean;
+              if (clean) adminPhone = clean;
+            }
+          }
         }
-      } catch (err) {}
+      } catch (err) {
+        // Non-blocking fallback
+      }
       
       const serviceFee = pricing.serviceFees[baseProduct] !== undefined ? pricing.serviceFees[baseProduct] : (pricing.serviceFees['Other'] || 100);
       const discount = applyCoins ? Math.floor(loyaltyCoins / 10) : 0;
       const estTotal = Math.max(0, pricing.homeVisitCharge + serviceFee - discount);
 
-      const newComplaintData = {
-        assignedAreaAdminId,
+      const newComplaintData: Record<string, any> = {
+        assignedAreaAdminId: assignedAreaAdminId || null,
         autoRouted: !!assignedAreaAdminId,
         name,
         phone: phoneInput,
@@ -168,52 +232,74 @@ export default function ComplaintForm() {
         address: addressInput,
         product,
         issue,
-        ...(issueImage && { issueImageUrl: issueImage }),
         priority,
         timeslot,
         status: 'Pending',
         createdAt: new Date().toISOString(),
         serviceFee,
         discount,
-        estTotal
+        estTotal,
+        ...(issueImage && { issueImageUrl: issueImage })
       };
 
-      const complaintsListRef = ref(rtdb, 'complaints');
-      const newComplaintRef = push(complaintsListRef);
-      await set(newComplaintRef, newComplaintData);
-      const newComplaintId = newComplaintRef.key || Date.now().toString();
+      // 2. Primary Save: Cloud Firestore with a 15-second safety timeout
+      const firestoreWritePromise = addDoc(collection(db, 'complaints'), newComplaintData);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('Database write timed out. Please check your internet connection and try again.'));
+        }, 15000);
+      });
 
+      const docRef = await Promise.race([firestoreWritePromise, timeoutPromise]);
+      const newComplaintId = docRef.id;
+
+      // 3. Fire-and-forget background sync to RTDB if active (non-blocking)
+      try {
+        const complaintsListRef = ref(rtdb, 'complaints/' + newComplaintId);
+        set(complaintsListRef, newComplaintData).catch(() => {});
+      } catch (e) {}
+
+      // 4. Update local storage for optimistic immediate display in tracking/admin
+      try {
+        const stored = safeJSONParse(localStorage.getItem('app_complaints'), []);
+        const updated = [{ id: newComplaintId, ...newComplaintData }, ...stored];
+        localStorage.setItem('app_complaints', JSON.stringify(updated));
+      } catch (e) {}
+
+      // 5. Success state
+      setIsSubmitting(false);
+      setIsSuccess(true);
+      setSuccessJobId(newComplaintId);
+
+      // WhatsApp Notification
       const currentHour = new Date().getHours();
       const isClosed = currentHour < 9 || currentHour >= 21;
       const hoursMessage = isClosed ? '\n\n*Note:* Our shop is currently closed. Our technician will connect with you first thing tomorrow morning.' : '';
       const receiptMessage = `*🛠️ Booking Confirmed!*\n\n*Job ID:* ${newComplaintId.substring(0, 8).toUpperCase()}\n*Name:* ${name}\n*Appliance:* ${product}\n*Issue:* ${issue}\n*Timeslot:* ${timeslot}\n*Status:* Pending\n*Location:* ${addressInput}\n\n*Cost Estimate:*\nHome Visit Charge: ₹${pricing.homeVisitCharge}\nService Fee: ₹${serviceFee}\n${applyCoins ? `Coins Discount: -₹${discount}\n` : ''}*Estimated Total: ₹${estTotal}*\n(Note: Spare parts/hardware replacement charges are extra if required)${hoursMessage}\n\nThank you for choosing Sachin Electricals!`;
       
-      let adminPhone = "918381892161";
+      const whatsappUrl = `https://wa.me/${adminPhone}?text=${encodeURIComponent(receiptMessage)}`;
       try {
-        const snapshot = await get(ref(rtdb, 'areaAdmins'));
-        if (snapshot.exists()) {
-          const admins = Object.keys(snapshot.val()).map(k => snapshot.val()[k]);
-          const matchingAdmin = admins.find((a: any) => a.pincodes && a.pincodes.includes(finalPincode) && a.isActive);
-          if (matchingAdmin && matchingAdmin.phone) {
-            adminPhone = matchingAdmin.phone.replace(/[^0-9]/g, '');
-            if (adminPhone.length === 10) adminPhone = "91" + adminPhone;
-          }
-        }
+        window.open(whatsappUrl, '_blank');
       } catch(e) {}
       
-      const whatsappUrl = `https://wa.me/${adminPhone}?text=${encodeURIComponent(receiptMessage)}`;
-      setIsSuccess(true);
-      window.open(whatsappUrl, '_blank');
-      
-      setTimeout(() => setIsSuccess(false), 3000);
-      (e.target as HTMLFormElement).reset();
+      // Reset form states ONLY upon confirmed successful save
+      try { formElement.reset(); } catch (e) {}
+      setNameText('');
+      setPincodeText('');
+      setPhoneText('');
+      setAddressText('');
       setIssueText('');
       setCustomProduct('');
+      setSelectedProduct('');
+      setSelectedServiceRateId('');
       setIssueImage(null);
-    } catch (error) {
-      console.warn("Error:", error);
-    } finally {
+      setApplyCoins(false);
+
+    } catch (error: any) {
+      console.error("Error submitting report:", error);
       setIsSubmitting(false);
+      // Keep user input intact and display the actual useful error message
+      setErrorMessage(error?.message || "Failed to submit report. Please check your network and try again.");
     }
   };
 
@@ -223,21 +309,51 @@ export default function ComplaintForm() {
     setIsTracking(true);
     try {
       let complaints: Complaint[] = [];
-      // Fetch from RTDB
+      const cleanSearch = trackPhone.trim().replace(/[^0-9a-zA-Z]/g, '').toLowerCase();
+
+      // 1. Fetch from Cloud Firestore
+      try {
+        const snapshot = await getDocs(collection(db, 'complaints'));
+        if (!snapshot.empty) {
+          const fsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Complaint[];
+          const remoteComplaints = fsData.filter((c: any) => {
+            const cPhone = String(c.phone || c.mobile || '').replace(/[^0-9]/g, '');
+            const cId = String(c.id || '').toLowerCase();
+            return cPhone.endsWith(cleanSearch) || cPhone === cleanSearch || cId === cleanSearch || cId.startsWith(cleanSearch);
+          });
+          complaints = remoteComplaints;
+        }
+      } catch (fsErr) {
+        console.warn('Firestore tracking fetch error', fsErr);
+      }
+
+      // 2. Merge with RTDB if available
       try {
         const snapshot = await get(ref(rtdb, 'complaints'));
         if (snapshot.exists()) {
           const val = snapshot.val();
           const rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
-          const remoteComplaints = rtdbData.filter((c: any) => c.phone === trackPhone || c.id === trackPhone);
-          
-          // Merge
+          const remoteComplaints = rtdbData.filter((c: any) => {
+            const cPhone = String(c.phone || c.mobile || '').replace(/[^0-9]/g, '');
+            const cId = String(c.id || '').toLowerCase();
+            return cPhone.endsWith(cleanSearch) || cPhone === cleanSearch || cId === cleanSearch;
+          });
           const all = [...complaints, ...remoteComplaints];
           complaints = [...new Map(all.map(item => [item.id, item])).values()];
         }
-      } catch (e) {
-        console.warn('RTDB tracking fetch error', e);
-      }
+      } catch (e) {}
+
+      // 3. Merge with local storage fallback
+      try {
+        const local = safeJSONParse(localStorage.getItem('app_complaints'), []);
+        const localMatches = local.filter((c: any) => {
+          const cPhone = String(c.phone || c.mobile || '').replace(/[^0-9]/g, '');
+          const cId = String(c.id || '').toLowerCase();
+          return cPhone.endsWith(cleanSearch) || cPhone === cleanSearch || cId === cleanSearch;
+        });
+        const all = [...complaints, ...localMatches];
+        complaints = [...new Map(all.map(item => [item.id, item])).values()];
+      } catch (e) {}
 
       setTrackedComplaints(complaints.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
     } catch (error) {
@@ -331,7 +447,12 @@ export default function ComplaintForm() {
                     <CheckCircle2 className="h-10 w-10" />
                   </div>
                   <h4 className="text-2xl font-bold text-slate-900">Request Received!</h4>
-                  <p className="text-slate-600 mb-2">Your complaint has been registered successfully.</p>
+                  <p className="text-slate-600 mb-1">Your complaint has been registered and saved successfully.</p>
+                  {successJobId && (
+                    <div className="bg-blue-50 border border-blue-200 px-4 py-2 rounded-xl text-blue-900 font-mono text-sm font-bold">
+                      Job ID: #{successJobId.substring(0, 8).toUpperCase()}
+                    </div>
+                  )}
                   {isClosed ? (
                     <p className="text-blue-700 bg-blue-50 px-4 py-2 rounded-lg text-sm font-medium">
                       Our shop is currently closed. Our technician will connect with you first thing tomorrow morning.
@@ -339,6 +460,16 @@ export default function ComplaintForm() {
                   ) : (
                     <p className="text-slate-600">Our team will contact you shortly.</p>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsSuccess(false);
+                      setSuccessJobId('');
+                    }}
+                    className="mt-4 px-6 py-2.5 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-colors shadow-md text-sm"
+                  >
+                    + Book Another Repair
+                  </button>
                 </motion.div>
               ) : (
                 <form onSubmit={handleSubmit} className="space-y-6">
@@ -530,6 +661,16 @@ export default function ComplaintForm() {
                       </p>
                     </div>
                   </div>
+
+                  {errorMessage && (
+                    <div className="p-4 bg-red-50 border border-red-200 rounded-xl text-red-700 text-sm flex items-start gap-3 animate-[fadeIn_0.3s_ease-out]">
+                      <AlertCircle className="w-5 h-5 text-red-600 mt-0.5 shrink-0" />
+                      <div>
+                        <p className="font-bold text-red-800">Submission Failed</p>
+                        <p className="text-xs text-red-700 mt-0.5">{errorMessage}</p>
+                      </div>
+                    </div>
+                  )}
 
                   <button 
                     type="submit" 

@@ -32,5 +32,8 @@ service cloud.firestore {
     match /loyalty/{document=**} {
       allow read, write: if true;
     }
+    match /orders/{document=**} {
+      allow read, write: if true;
+    }
   }
 }

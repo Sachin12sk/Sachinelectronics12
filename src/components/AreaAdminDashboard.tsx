@@ -4,6 +4,7 @@ import { useGlobalState } from "../context/GlobalContext";
 import ErrorBoundary from "./ErrorBoundary";
 
 import { rtdb, db, complaintsCollection } from "../lib/firebase";
+import { onSnapshot, doc, updateDoc, deleteDoc } from 'firebase/firestore';
 import { Complaint } from "../types";
 
 
@@ -82,34 +83,61 @@ function InnerAreaAdminDashboard() {
 
   
   useEffect(() => {
-    const complaintsRef = ref(rtdb, 'complaints');
-    const unsubscribe = onValue(complaintsRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        let rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
+    // 1. Cloud Firestore real-time listener
+    const unsubFs = onSnapshot(complaintsCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        let fsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Complaint[];
         
         const sessionData = safeJSONParse(localStorage.getItem('area_admin_session'), null);
         const currentAdminPincodes = sessionData?.pincodes || sessionData?.assignedPincodes || [sessionData?.pincode] || [];
+        const adminPincodesArray = String(currentAdminPincodes || '').split(',').map(p => p.trim());
         
-        const adminPincodesArray = String(currentAdminPincodes || '')
-          .split(',')
-          .map(p => p.trim());
-        
-        const filteredComplaints = rtdbData.filter((complaint: any) => {
-           const compPin = String(complaint.pincode || complaint.pinCode || '').trim();
-           return adminPincodesArray.some(adminPin => adminPin === compPin);
+        const filtered = fsData.filter((complaint: any) => {
+          const compPin = String(complaint.pincode || complaint.pinCode || '').trim();
+          return adminPincodesArray.some(adminPin => adminPin === compPin);
         });
-        
-        const sorted = filteredComplaints.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+        const sorted = (filtered.length > 0 ? filtered : fsData).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
         setComplaints(sorted);
-      } else {
-        setComplaints([]);
       }
     }, (error) => {
-      console.warn('Error fetching area admin complaints', error);
+      console.warn('Error fetching Firestore area admin complaints note:', error);
     });
 
-    return () => unsubscribe();
+    // 2. Also listen to RTDB if active
+    let unsubscribe = () => {};
+    try {
+      const complaintsRef = ref(rtdb, 'complaints');
+      unsubscribe = onValue(complaintsRef, (snapshot) => {
+        if (snapshot.exists()) {
+          const val = snapshot.val();
+          let rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
+          
+          const sessionData = safeJSONParse(localStorage.getItem('area_admin_session'), null);
+          const currentAdminPincodes = sessionData?.pincodes || sessionData?.assignedPincodes || [sessionData?.pincode] || [];
+          
+          const adminPincodesArray = String(currentAdminPincodes || '')
+            .split(',')
+            .map(p => p.trim());
+          
+          const filteredComplaints = rtdbData.filter((complaint: any) => {
+             const compPin = String(complaint.pincode || complaint.pinCode || '').trim();
+             return adminPincodesArray.some(adminPin => adminPin === compPin);
+          });
+          
+          const sorted = filteredComplaints.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          setComplaints(prev => {
+            const merged = [...prev, ...sorted];
+            return [...new Map(merged.map(item => [item.id, item])).values()].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          });
+        }
+      }, () => {});
+    } catch(e) {}
+
+    return () => {
+      unsubFs();
+      unsubscribe();
+    };
   }, []);
 
 
