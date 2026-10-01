@@ -34,13 +34,15 @@ export default function MasterComplaintsView({
 
   const filteredComplaints = useMemo(() => {
     return complaints?.filter(c => {
-      const matchesPhone = c?.phone?.includes(searchPhone);
+      const cPhone = String(c?.phone || (c as any)?.mobile || '').replace(/[^0-9]/g, '');
+      const cleanSearch = (searchPhone || '').replace(/[^0-9]/g, '');
+      const matchesPhone = !cleanSearch || cPhone.includes(cleanSearch);
       
       let matchesStatus = true;
       if (statusFilter === 'COMPLETED') {
-        matchesStatus = c?.status === 'COMPLETED';
+        matchesStatus = c?.status === 'COMPLETED' || c?.status === 'Completed' || c?.status === 'Resolved';
       } else if (statusFilter === 'Pending') {
-        matchesStatus = c?.status !== 'COMPLETED';
+        matchesStatus = c?.status !== 'COMPLETED' && c?.status !== 'Completed' && c?.status !== 'Resolved';
       } else if (statusFilter !== 'All') {
         matchesStatus = c?.status === statusFilter;
       }

@@ -1,6 +1,4 @@
 import { useState, useRef, useEffect } from 'react';
-import { push, ref } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
 import { MessageSquare, X, Send, User, Bot, Loader2, Camera } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -131,8 +129,6 @@ export default function LiveChat() {
             ...newComplaint,
             id: docRef.id
           });
-          // Background sync to RTDB if active
-          try { push(ref(rtdb, 'complaints'), newComplaint).catch(() => {}); } catch(e) {}
         }).catch(dbError => {
           console.error("Error saving booking to Firestore:", dbError);
           setBookingCompleted({
@@ -209,7 +205,6 @@ export default function LiveChat() {
             ...newComplaint,
             id: docRef.id
           });
-          try { push(ref(rtdb, 'complaints'), newComplaint).catch(() => {}); } catch(e) {}
         } catch (dbError) {
           console.error("Error saving booking:", dbError);
         }

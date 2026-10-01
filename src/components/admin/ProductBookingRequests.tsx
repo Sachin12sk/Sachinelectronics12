@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { ref, onValue, update } from 'firebase/database';
-import { rtdb } from '../../lib/firebase';
+import { onSnapshot, doc, updateDoc } from 'firebase/firestore';
+import { db, ordersCollection } from '../../lib/firebase';
 import { Order, OrderStatus } from '../../types';
 import {
   Package,
@@ -38,29 +38,35 @@ export default function ProductBookingRequests({ allowedPincodes }: ProductBooki
   const [updatedNotice, setUpdatedNotice] = useState<string | null>(null);
 
   useEffect(() => {
-    const ordersRef = ref(rtdb, 'orders');
-    const unsubscribe = onValue(ordersRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const list: Order[] = Object.keys(val).map((key) => {
-          const item = val[key];
-          const cleanId = (item.orderId || key).replace(/^#+/, '');
-          return {
-            id: key,
-            orderId: cleanId,
-            formattedOrderId: item.formattedOrderId || `#${cleanId}`,
-            ...item
-          };
-        });
+    const unsubscribe = onSnapshot(
+      ordersCollection,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const list: Order[] = snapshot.docs.map((d) => {
+            const item = d.data();
+            const cleanId = (item.orderId || d.id).replace(/^#+/, '');
+            return {
+              ...item,
+              id: d.id,
+              orderId: cleanId,
+              formattedOrderId: item.formattedOrderId || `#${cleanId}`
+            } as Order;
+          });
 
-        // Sort by booking date (newest first)
-        list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-        setOrders(list);
-      } else {
+          // Sort by booking date (newest first)
+          list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+          setOrders(list);
+        } else {
+          setOrders([]);
+        }
+        setLoading(false);
+      },
+      (error) => {
+        console.warn('Firestore orders sync note:', error);
         setOrders([]);
+        setLoading(false);
       }
-      setLoading(false);
-    });
+    );
 
     return () => unsubscribe();
   }, []);
@@ -78,10 +84,9 @@ export default function ProductBookingRequests({ allowedPincodes }: ProductBooki
   };
 
   const handleStatusChange = async (order: Order, newStatus: string) => {
-    const cleanId = (order.orderId || order.id).replace(/^#+/, '');
-    setUpdatingId(cleanId);
+    const docId = order.id || (order.orderId || '').replace(/^#+/, '');
+    setUpdatingId(docId);
     try {
-      const orderRef = ref(rtdb, `orders/${cleanId}`);
       const updatedTimeline = Array.isArray(order.statusTimeline) ? [...order.statusTimeline] : [];
       updatedTimeline.push({
         status: newStatus as OrderStatus,
@@ -89,16 +94,17 @@ export default function ProductBookingRequests({ allowedPincodes }: ProductBooki
         note: `Status updated to ${newStatus} by Administrator.`
       });
 
-      await update(orderRef, {
+      await updateDoc(doc(db, 'orders', docId), {
         status: newStatus,
         updatedAt: new Date().toISOString(),
         statusTimeline: updatedTimeline
       });
 
-      setUpdatedNotice(`Updated #${cleanId} to ${newStatus}`);
+      setUpdatedNotice(`Updated #${docId} to ${newStatus}`);
       setTimeout(() => setUpdatedNotice(null), 3000);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to update order status:', err);
+      alert('Failed to update order status: ' + (err?.message || 'Error'));
     } finally {
       setUpdatingId(null);
     }

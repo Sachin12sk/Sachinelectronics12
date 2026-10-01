@@ -55,3 +55,20 @@ export const isValidFile = (file: File): boolean => {
 
   return true;
 };
+
+export const hashPassword = (password: string, customSalt?: string): { hash: string; salt: string } => {
+  const salt = customSalt || CryptoJS.lib.WordArray.random(16).toString();
+  const hash = CryptoJS.SHA256(password + ':' + salt).toString();
+  return { hash, salt };
+};
+
+export const verifyPassword = (candidatePassword: string, storedHash: string, salt: string): boolean => {
+  if (!candidatePassword || !storedHash || !salt) return false;
+  const hash = CryptoJS.SHA256(candidatePassword + ':' + salt).toString();
+  return hash === storedHash;
+};
+
+export const normalizePincode = (pin: any): string => {
+  if (pin === null || pin === undefined) return '';
+  return String(pin).replace(/[^0-9a-zA-Z]/g, '').trim().toUpperCase();
+};

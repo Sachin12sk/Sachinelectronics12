@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { ref, onValue } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
+import { onSnapshot } from 'firebase/firestore';
+import { productsCollection } from '../lib/firebase';
 import { Product } from '../types';
 import { products as defaultProducts } from '../data';
 import { Search, X, ShoppingBag, ArrowRight, Sparkles } from 'lucide-react';
@@ -11,21 +11,28 @@ export default function Hero() {
   const [isFocused, setIsFocused] = useState(false);
   const searchContainerRef = useRef<HTMLDivElement>(null);
 
-  // Realtime Firebase Sync
+  // Realtime Cloud Firestore Sync for Products
   useEffect(() => {
-    const db = rtdb;
-    const productsRef = ref(db, 'products');
-    const unsubscribe = onValue(productsRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const liveProducts = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Product[];
-        if (liveProducts.length > 0) {
-          setProducts(liveProducts);
+    const unsubscribe = onSnapshot(
+      productsCollection,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const liveProducts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Product[];
+          const existingIds = new Set(liveProducts.map(p => p.id));
+          const combined = [
+            ...liveProducts,
+            ...defaultProducts.filter(p => !existingIds.has(p.id))
+          ];
+          setProducts(combined);
+        } else {
+          setProducts(defaultProducts);
         }
+      },
+      (err) => {
+        console.warn("Firestore products sync note in Hero:", err);
+        setProducts(defaultProducts);
       }
-    }, (err) => {
-      console.warn("RTDB products sync note:", err);
-    });
+    );
 
     return () => unsubscribe();
   }, []);

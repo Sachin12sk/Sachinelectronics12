@@ -1,8 +1,7 @@
-import { ref, set } from 'firebase/database';
 import React, { useState, useRef } from 'react';
 import { Camera, Upload, CheckCircle2, XCircle, ArrowRight, ShieldCheck, MapPin, User, Phone, Wrench } from 'lucide-react';
-
-import { rtdb, db } from '../lib/firebase';
+import { doc, setDoc } from 'firebase/firestore';
+import { db, technicianApplicationsCollection } from '../lib/firebase';
 import { TechnicianApplication } from '../types';
 import { secureStorage, isValidFile } from '../lib/security';
 
@@ -253,8 +252,11 @@ export default function TechnicianRegistration() {
         createdAt: new Date().toISOString(),
       };
 
-      // Fire and forget Firebase save to not block the UI
-      set(ref(rtdb, 'technicianApplications/' + application.id), application).catch(err => console.error('RTDB save failed:', err));
+      // Save in Cloud Firestore technicianApplications collection
+      await Promise.race([
+        setDoc(doc(db, 'technicianApplications', application.id), application),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Save timeout')), 10000))
+      ]);
       
       
       

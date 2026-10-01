@@ -34,23 +34,21 @@ export default defineConfig(() => {
         },
         workbox: {
           maximumFileSizeToCacheInBytes: 5242880,
+          navigateFallbackDenylist: [
+            /^\/__/,
+            /^https:\/\/(?:firestore\.googleapis\.com|.*\.firebaseio\.com|.*\.firebasedatabase\.app|identitytoolkit\.googleapis\.com|securetoken\.googleapis\.com)/i
+          ],
           runtimeCaching: [
+            {
+              urlPattern: /^https:\/\/(?:firestore\.googleapis\.com|.*\.firebaseio\.com|.*\.firebasedatabase\.app|identitytoolkit\.googleapis\.com|securetoken\.googleapis\.com)\/.*/i,
+              handler: 'NetworkOnly'
+            },
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
               handler: 'CacheFirst',
               options: {
                 cacheName: 'google-fonts-cache',
                 expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 * 365 },
-                cacheableResponse: { statuses: [0, 200] }
-              }
-            },
-            {
-              urlPattern: /^https:\/\/firestore\.googleapis\.com\/.*/i,
-              handler: 'NetworkFirst',
-              options: {
-                cacheName: 'firebase-data-cache',
-                networkTimeoutSeconds: 5,
-                expiration: { maxEntries: 50, maxAgeSeconds: 60 * 60 * 24 },
                 cacheableResponse: { statuses: [0, 200] }
               }
             }

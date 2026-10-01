@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { ref, onValue, update, remove } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
+import { onSnapshot, doc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { db, ordersCollection } from '../lib/firebase';
 import { Order, OrderStatus } from '../types';
 import {
   Package,
@@ -50,26 +50,33 @@ export default function AdminOrdersManager({ allowedPincodes, userRole = 'super_
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
-    const ordersRef = ref(rtdb, 'orders');
-    const unsubscribe = onValue(ordersRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const list: Order[] = Object.keys(val).map((key) => {
-          return {
-            id: key,
-            orderId: val[key].orderId || key,
-            ...val[key]
-          };
-        });
+    const unsubscribe = onSnapshot(
+      ordersCollection,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const list: Order[] = snapshot.docs.map((d) => {
+            const data = d.data();
+            return {
+              ...data,
+              id: d.id,
+              orderId: data.orderId || d.id
+            };
+          }) as Order[];
 
-        // Sort by createdAt descending
-        list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-        setOrders(list);
-      } else {
+          // Sort by createdAt descending
+          list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+          setOrders(list);
+        } else {
+          setOrders([]);
+        }
+        setLoading(false);
+      },
+      (error) => {
+        console.warn('Firestore orders sync note:', error);
         setOrders([]);
+        setLoading(false);
       }
-      setLoading(false);
-    });
+    );
 
     return () => unsubscribe();
   }, []);
@@ -114,8 +121,6 @@ export default function AdminOrdersManager({ allowedPincodes, userRole = 'super_
 
     setIsSaving(true);
     try {
-      const orderRef = ref(rtdb, `orders/${editingOrder.id}`);
-      
       const newTimeline = editingOrder.statusTimeline ? [...editingOrder.statusTimeline] : [];
       if (editingOrder.status !== editStatus) {
         newTimeline.push({
@@ -125,7 +130,7 @@ export default function AdminOrdersManager({ allowedPincodes, userRole = 'super_
         });
       }
 
-      await update(orderRef, {
+      await updateDoc(doc(db, 'orders', editingOrder.id), {
         status: editStatus,
         estimatedDelivery: editEstimatedDelivery,
         remarks: editRemarks,
@@ -134,9 +139,9 @@ export default function AdminOrdersManager({ allowedPincodes, userRole = 'super_
       });
 
       setEditingOrder(null);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error updating order:', err);
-      alert('Failed to update order');
+      alert('Failed to update order: ' + (err?.message || 'Error'));
     } finally {
       setIsSaving(false);
     }
@@ -148,10 +153,10 @@ export default function AdminOrdersManager({ allowedPincodes, userRole = 'super_
     }
 
     try {
-      await remove(ref(rtdb, `orders/${orderId}`));
-    } catch (err) {
+      await deleteDoc(doc(db, 'orders', orderId));
+    } catch (err: any) {
       console.error('Error deleting order:', err);
-      alert('Failed to delete order');
+      alert('Failed to delete order: ' + (err?.message || 'Error'));
     }
   };
 

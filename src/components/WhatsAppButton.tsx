@@ -1,12 +1,7 @@
-import { ref, get } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
-
-
-
 import React, { useState, useEffect } from 'react';
 import { MessageCircle, X } from 'lucide-react';
-
-import { db } from '../lib/firebase';
+import { getDocs } from 'firebase/firestore';
+import { areaAdminsCollection } from '../lib/firebase';
 
 export default function WhatsAppButton() {
   const [isOpen, setIsOpen] = useState(false);
@@ -14,16 +9,17 @@ export default function WhatsAppButton() {
   const [areaAdmins, setAreaAdmins] = useState<any[]>([]);
 
   useEffect(() => {
-    // Fetch area admins once
+    // Fetch area admins from Firestore
     const fetchAdmins = async () => {
       try {
-        const snap = await get(ref(rtdb, 'areaAdmins'));
-        let admins: any[] = [];
-        if (snap.exists()) {
-           const data = snap.val();
-           admins = Object.keys(data).map(k => data[k]);
+        const snap = await getDocs(areaAdminsCollection);
+        if (!snap.empty) {
+          const admins = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+          setAreaAdmins(admins);
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('Firestore areaAdmins fetch note in WhatsAppButton:', e);
+      }
     };
     fetchAdmins();
   }, []);

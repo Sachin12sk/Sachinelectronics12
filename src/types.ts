@@ -123,16 +123,22 @@ export interface TechnicianApplication {
 export interface AreaAdmin {
   id?: string;
   name: string;
+  loginId?: string;
   phone: string;
   email: string;
   password?: string;
+  passwordHash?: string;
+  passwordSalt?: string;
   pincodes: string[];
+  assignedPincodes?: string[];
   isActive: boolean;
   permissions: {
     canEditInventory: boolean;
     canAlertTechs: boolean;
     canWA: boolean;
   };
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface CustomerLoyalty {

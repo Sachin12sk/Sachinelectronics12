@@ -18,7 +18,7 @@ const firebaseConfig = {
 };
 
 export const app = initializeApp(firebaseConfig);
-export const db = initializeFirestore(app, { experimentalForceLongPolling: true }, import.meta.env.VITE_FIREBASE_DATABASE_ID || config.firestoreDatabaseId);
+export const db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true }, import.meta.env.VITE_FIREBASE_DATABASE_ID || config.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const rtdb = getDatabase(app);
 
@@ -35,3 +35,5 @@ export const technicianApplicationsCollection = collection(db, 'technicianApplic
 export const areaAdminsCollection = collection(db, 'areaAdmins');
 export const loyaltyCollection = collection(db, 'loyalty');
 export const ordersCollection = collection(db, 'orders');
+export const leavesCollection = collection(db, 'leaves');
+export const attendanceCollection = collection(db, 'attendance');

@@ -18,8 +18,8 @@ import {
   Info
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { ref, get, onValue } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
+import { doc, getDoc, getDocs, onSnapshot } from 'firebase/firestore';
+import { db, ordersCollection } from '../lib/firebase';
 import { Order, OrderStatus } from '../types';
 
 interface MyOrdersModalProps {
@@ -95,13 +95,19 @@ export default function MyOrdersModal({ isOpen, onClose, initialOrderId }: MyOrd
   useEffect(() => {
     if (!activeOrder?.id) return;
     const cleanId = activeOrder.id.replace('#', '').trim();
-    const orderRef = ref(rtdb, `orders/${cleanId}`);
-    const unsubscribe = onValue(orderRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const data = snapshot.val();
-        setActiveOrder({ id: cleanId, orderId: cleanId, ...data });
+    const orderDocRef = doc(db, 'orders', cleanId);
+    const unsubscribe = onSnapshot(
+      orderDocRef,
+      (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.data();
+          setActiveOrder({ ...data, id: cleanId, orderId: cleanId } as Order);
+        }
+      },
+      (err) => {
+        console.warn('Firestore active order live sync note:', err);
       }
-    });
+    );
 
     return () => unsubscribe();
   }, [activeOrder?.id]);
@@ -130,12 +136,11 @@ export default function MyOrdersModal({ isOpen, onClose, initialOrderId }: MyOrd
     setSearched(true);
 
     try {
-      // 1. Try direct lookup under orders/TARGET
-      const directRef = ref(rtdb, `orders/${target}`);
-      const directSnap = await get(directRef);
+      // 1. Try direct lookup in Cloud Firestore under orders/target
+      const directDoc = await getDoc(doc(db, 'orders', target));
 
-      if (directSnap.exists()) {
-        const data = directSnap.val();
+      if (directDoc.exists()) {
+        const data = directDoc.data();
         const orderRecord = { id: target, orderId: target, formattedOrderId: `#${target}`, ...data } as Order;
         setActiveOrder(orderRecord);
         saveToRecentOrders(target);
@@ -145,9 +150,9 @@ export default function MyOrdersModal({ isOpen, onClose, initialOrderId }: MyOrd
 
       // If user typed 5-digit number without prefix (e.g. 45787), try with ORD- prefix
       if (!target.startsWith('ORD-') && /^\d+$/.test(target)) {
-        const ordPrefixedSnap = await get(ref(rtdb, `orders/ORD-${target}`));
-        if (ordPrefixedSnap.exists()) {
-          const data = ordPrefixedSnap.val();
+        const ordPrefixedDoc = await getDoc(doc(db, 'orders', `ORD-${target}`));
+        if (ordPrefixedDoc.exists()) {
+          const data = ordPrefixedDoc.data();
           const orderRecord = { id: `ORD-${target}`, orderId: `ORD-${target}`, formattedOrderId: `#ORD-${target}`, ...data } as Order;
           setActiveOrder(orderRecord);
           saveToRecentOrders(`ORD-${target}`);
@@ -156,15 +161,13 @@ export default function MyOrdersModal({ isOpen, onClose, initialOrderId }: MyOrd
         }
       }
 
-      // 2. Fallback: Query all orders to match case-insensitively, handling # prefix, orderId property, or phone
-      const allOrdersRef = ref(rtdb, 'orders');
-      const allSnap = await get(allOrdersRef);
+      // 2. Query all orders in Firestore to match case-insensitively, handling # prefix, orderId property, or phone
+      const allOrdersSnap = await getDocs(ordersCollection);
 
-      if (allSnap.exists()) {
-        const allData = allSnap.val();
-        const foundKey = Object.keys(allData).find((key) => {
-          const item = allData[key];
-          const kNorm = stripHashAndTrim(key);
+      if (!allOrdersSnap.empty) {
+        const foundDoc = allOrdersSnap.docs.find((d) => {
+          const item = d.data();
+          const kNorm = stripHashAndTrim(d.id);
           const ordIdNorm = stripHashAndTrim(item.orderId || '');
           const idNorm = stripHashAndTrim(item.id || '');
           const formattedNorm = stripHashAndTrim(item.formattedOrderId || '');
@@ -185,11 +188,11 @@ export default function MyOrdersModal({ isOpen, onClose, initialOrderId }: MyOrd
           );
         });
 
-        if (foundKey) {
-          const rawItem = allData[foundKey];
-          const cleanId = stripHashAndTrim(rawItem.orderId || foundKey);
+        if (foundDoc) {
+          const rawItem = foundDoc.data();
+          const cleanId = stripHashAndTrim(rawItem.orderId || foundDoc.id);
           const matched = {
-            id: foundKey,
+            id: foundDoc.id,
             orderId: cleanId,
             formattedOrderId: `#${cleanId}`,
             ...rawItem
@@ -205,7 +208,7 @@ export default function MyOrdersModal({ isOpen, onClose, initialOrderId }: MyOrd
       setActiveOrder(null);
       setErrorMessage('Invalid Order ID. Please check and try again.');
     } catch (err) {
-      console.error('Error fetching order:', err);
+      console.error('Error fetching order from Firestore:', err);
       setActiveOrder(null);
       setErrorMessage('Invalid Order ID. Please check and try again.');
     } finally {

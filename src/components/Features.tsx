@@ -1,9 +1,7 @@
 import { Clock, ShieldCheck, ThumbsUp, MapPin, MessageSquare, Wrench } from 'lucide-react';
-import { push, ref } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-
+import { addDoc, collection } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import featuresBgImg from '../assets/images/features_background_1785441954792.jpg';
 
@@ -59,7 +57,7 @@ export default function Features() {
     
     setIsSubmitting(true);
     try {
-      await push(ref(rtdb, 'feedback'), {
+      await addDoc(collection(db, 'feedback'), {
         featureId: feedbackFeature,
         text: feedbackText,
         createdAt: new Date().toISOString()

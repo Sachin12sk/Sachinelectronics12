@@ -1,14 +1,12 @@
-import { ref, set, get, update, push, remove, onValue } from 'firebase/database';
 import React, { useState, useEffect, useMemo } from 'react';
 import { useGlobalState } from "../context/GlobalContext";
 import ErrorBoundary from "./ErrorBoundary";
-import { rtdb, db, productsCollection, complaintsCollection, settingsCollection, auth, promotionsCollection, technicianApplicationsCollection, areaAdminsCollection } from '../lib/firebase';
-import { addDoc, getDocs, collection, updateDoc, deleteDoc, doc, query, orderBy, getDoc, setDoc, where, onSnapshot } from 'firebase/firestore';
+import { db, productsCollection, complaintsCollection, settingsCollection, auth, promotionsCollection, technicianApplicationsCollection, areaAdminsCollection, inventoryCollection, techniciansCollection, leavesCollection, attendanceCollection } from '../lib/firebase';
+import { addDoc, getDocs, collection, updateDoc, deleteDoc, doc, query, orderBy, getDoc, setDoc, where, onSnapshot, deleteField } from 'firebase/firestore';
 import { signInWithEmailAndPassword, sendPasswordResetEmail } from 'firebase/auth';
 import { Product, Complaint, ServiceRate, BannerSettings, InventoryItem, Technician, Promotion } from '../types';
 import { Trash2, CheckCircle, Edit2, Plus, LogOut, Check, Search, Filter, Home, Upload, Camera, MessageCircle, Download, LayoutTemplate, Package, AlertTriangle, Users, Clock, MessageSquare } from 'lucide-react';
 import { generateInvoice } from '../utils/generateInvoice';
-import { inventoryCollection, techniciansCollection } from '../lib/firebase';
 import DOMPurify from 'dompurify';
 import VoiceInput from './VoiceInput';
 import AIManager from './AIManager';
@@ -19,7 +17,7 @@ import InvoiceGeneratorModal from './InvoiceGeneratorModal';
 import AdminOrdersManager from './AdminOrdersManager';
 import ProductBookingRequests from './admin/ProductBookingRequests';
 import AnalyticsReportsDashboard from './admin/AnalyticsReportsDashboard';
-import { secureStorage, isValidFile } from '../lib/security';
+import { secureStorage, isValidFile, hashPassword, verifyPassword, normalizePincode } from '../lib/security';
 
 function safeJSONParse(val: string | null, fallback: any) {
   if (!val) return fallback;
@@ -71,7 +69,11 @@ function InnerAdmin() {
   
   
   const [viewingAdminComplaints, setViewingAdminComplaints] = useState<any>(null);
-  const [aaModal, setAaModal] = useState({ isOpen: false, id: '', name: '', email: '', phone: '', password: '', pincodes: '', canEditInventory: true, canAlertTechs: true, canWA: true });
+  const [aaModal, setAaModal] = useState({ isOpen: false, id: '', name: '', loginId: '', email: '', phone: '', password: '', pincodes: '', isActive: true, canEditInventory: true, canAlertTechs: true, canWA: true });
+  const [aaFieldErrors, setAaFieldErrors] = useState<{ [key: string]: string }>({});
+  const [aaFormError, setAaFormError] = useState('');
+  const [isSavingAa, setIsSavingAa] = useState(false);
+  const [aaSuccessMessage, setAaSuccessMessage] = useState('');
 
   
   const [technicianApplications, setTechnicianApplications] = useState<any[]>([]);
@@ -133,33 +135,22 @@ function InnerAdmin() {
 
       const [leaves, setLeaves] = useState<any[]>([]);
   useEffect(() => {
-    const leavesRef = ref(rtdb, 'leaves');
-    const unsub = onValue(leavesRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        setLeaves(Object.keys(val).map(key => ({ id: key, ...val[key] })));
+    const unsub = onSnapshot(leavesCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        setLeaves(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
       } else {
         setLeaves([]);
       }
-    });
+    }, (err) => console.warn('Firestore leaves sync note:', err));
     return () => unsub();
   }, []);
 
-  useEffect(() => {
-    // Force sync Super Admin login password to Sachin@2200
+  const handleApproveLeave = async (id: string, status: 'Approved' | 'Rejected') => {
     try {
-      get(ref(rtdb, 'superAdminConfig/password')).then((snap) => {
-        if (!snap.exists() || snap.val() !== 'Sachin@2200') {
-          set(ref(rtdb, 'superAdminConfig/password'), 'Sachin@2200').catch((err) => {
-            console.warn('Could not sync superAdminConfig/password:', err);
-          });
-        }
-      }).catch(() => {});
-    } catch(e) {}
-  }, []);
-  
-  const handleApproveLeave = (id: string, status: 'Approved' | 'Rejected') => {
-    update(ref(rtdb, 'leaves/' + id), { status }).catch(e => console.warn(e));
+      await updateDoc(doc(db, 'leaves', id), { status });
+    } catch(e) {
+      console.warn('Error updating leave status in Firestore:', e);
+    }
   };
   const [editingTechId, setEditingTechId] = useState<string | null>(null);
 
@@ -182,56 +173,69 @@ function InnerAdmin() {
   const [newTech, setNewTech] = useState({ name: '', mobile: '', pincode: '', skills: '', loginId: '', password: '', areaAdminId: '', isActive: true, baseSalary: 15000 });
 
       
-  const handleDeleteActiveTech = (id: string) => {
+  const handleDeleteActiveTech = async (id: string) => {
     if (window.confirm('Are you sure you want to delete this technician? This action cannot be undone.')) {
-      remove(ref(rtdb, 'technicians/' + id)).then(() => {
+      try {
+        await deleteDoc(doc(db, 'technicians', id));
         alert('Deleted successfully');
-      }).catch(e => console.warn(e));
+      } catch (e: any) {
+        console.warn('Error deleting technician:', e);
+        alert('Failed to delete technician: ' + (e?.message || 'Error'));
+      }
     }
   };
 
-  const handleSaveNewTech = (e: React.FormEvent) => {
+  const handleSaveNewTech = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (editingTechId) {
-      const updatedData = {
-        name: newTech.name || '',
-        phone: newTech.mobile || '',
-        mobile: newTech.mobile || '',
-        loginId: newTech.loginId || '',
-        password: newTech.password || '',
-        areaAdminId: newTech.areaAdminId || '',
-        pinCode: newTech.pincode || '208001',
-        pincodes: [newTech.pincode || '208001'],
-        specialization: newTech.skills || 'Electricals',
-        skills: newTech.skills ? newTech.skills.split(',')?.map(s => s.trim()) : [],
-        isActive: newTech.isActive,
-        baseSalary: newTech.baseSalary,
-      };
-      update(ref(rtdb, 'technicians/' + editingTechId), updatedData).catch(e => console.warn(e));
-    } else {
-      const newTechData = {
-        id: 'tech_' + Date.now().toString(),
-        name: newTech.name || '',
-        phone: newTech.mobile || '',
-        mobile: newTech.mobile || '',
-        loginId: newTech.loginId || '',
-        password: newTech.password || '',
-        areaAdminId: newTech.areaAdminId || '',
-        pinCode: newTech.pincode || '208001',
-        pincodes: [newTech.pincode || '208001'],
-        specialization: newTech.skills || 'Electricals',
-        skills: newTech.skills ? newTech.skills.split(',')?.map(s => s.trim()) : [],
-        status: 'Approved',
-        isActive: newTech.isActive,
-        baseSalary: newTech.baseSalary,
-        role: 'technician',
-        createdAt: new Date().toISOString()
-      };
-      set(ref(rtdb, 'technicians/' + newTechData.id), newTechData).catch(e => console.warn(e));
+    try {
+      if (editingTechId) {
+        const updatedData = {
+          name: newTech.name || '',
+          phone: newTech.mobile || '',
+          mobile: newTech.mobile || '',
+          loginId: newTech.loginId || '',
+          password: newTech.password || '',
+          areaAdminId: newTech.areaAdminId || '',
+          pinCode: newTech.pincode || '208001',
+          pincodes: [newTech.pincode || '208001'],
+          specialization: newTech.skills || 'Electricals',
+          skills: newTech.skills ? newTech.skills.split(',')?.map(s => s.trim()) : [],
+          isActive: newTech.isActive,
+          baseSalary: newTech.baseSalary,
+          updatedAt: new Date().toISOString()
+        };
+        await updateDoc(doc(db, 'technicians', editingTechId), updatedData);
+        alert('Technician updated successfully!');
+      } else {
+        const docRef = doc(techniciansCollection);
+        const newTechData = {
+          id: docRef.id,
+          name: newTech.name || '',
+          phone: newTech.mobile || '',
+          mobile: newTech.mobile || '',
+          loginId: newTech.loginId || '',
+          password: newTech.password || '',
+          areaAdminId: newTech.areaAdminId || '',
+          pinCode: newTech.pincode || '208001',
+          pincodes: [newTech.pincode || '208001'],
+          specialization: newTech.skills || 'Electricals',
+          skills: newTech.skills ? newTech.skills.split(',')?.map(s => s.trim()) : [],
+          status: 'Approved',
+          isActive: newTech.isActive,
+          baseSalary: newTech.baseSalary,
+          role: 'technician',
+          createdAt: new Date().toISOString()
+        };
+        await setDoc(docRef, newTechData);
+        alert('Technician added successfully!');
+      }
+      setEditingTechId(null);
+      setNewTechModalOpen(false);
+      setNewTech({ name: '', mobile: '', pincode: '', skills: '', loginId: '', password: '', areaAdminId: '', isActive: true, baseSalary: 15000 });
+    } catch(e: any) {
+      console.error('Error saving technician:', e);
+      alert('Failed to save technician: ' + (e?.message || 'Error'));
     }
-    setEditingTechId(null);
-    setNewTechModalOpen(false);
-    setNewTech({ name: '', mobile: '', pincode: '', skills: '', loginId: '', password: '', areaAdminId: '', isActive: true, baseSalary: 15000 });
   };
   const [assigningComplaintId, setAssigningComplaintId] = useState<string | null>(null);
   const [selectedTechId, setSelectedTechId] = useState('');
@@ -283,46 +287,24 @@ function InnerAdmin() {
       setLoading(false);
     }
     
-    const intervalId = setInterval(() => {
-      if (localStorage.getItem('userRole') === 'super_admin') {
-        fetchTechnicianApplications();
-      }
-    }, 2000);
-    return () => clearInterval(intervalId);
   }, []);
 
   const fetchData = async () => {
-    setLoading(true);
-    await Promise.all([fetchTechnicianApplications()]);
     setLoading(false);
   };
 
-  const fetchTechnicianApplications = async () => {
-    try {
-      const snapshot = await get(ref(rtdb, 'technicianApplications'));
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const apps = Object.keys(val).map(key => ({ id: key, ...val[key] }));
-        apps.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  useEffect(() => {
+    const unsubscribe = onSnapshot(technicianApplicationsCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        const apps = snapshot.docs.map(docSnap => ({ id: docSnap.id, ...(docSnap.data() as any) })) as any[];
+        apps.sort((a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
         setTechnicianApplications(apps);
       } else {
         setTechnicianApplications([]);
       }
-    } catch (e) {
-      console.error('Error fetching applications', e);
-    }
-  };
-
-  useEffect(() => {
-    fetchTechnicianApplications();
-    const appRef = ref(rtdb, 'technicianApplications');
-    const unsubscribe = onValue(appRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const apps = Object.keys(val).map(key => ({ id: key, ...val[key] }));
-        apps.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-        setTechnicianApplications(apps);
-      }
+    }, (err) => {
+      console.warn("Firestore technician applications sync note:", err);
+      setTechnicianApplications([]);
     });
     return () => unsubscribe();
   }, []);
@@ -333,165 +315,132 @@ function InnerAdmin() {
     e.preventDefault();
     setIsSavingPricing(true);
     try {
-      const pricingRef = ref(rtdb, 'settings/pricing');
-      await set(pricingRef, pricingSettings);
+      await setDoc(doc(db, 'settings', 'pricing'), pricingSettings, { merge: true });
       alert('Pricing settings saved successfully!');
     } catch (error: any) {
       console.warn('Error saving pricing:', error);
-      alert('Failed to save pricing settings.');
+      alert('Failed to save pricing settings: ' + (error?.message || 'Error'));
     } finally {
       setIsSavingPricing(false);
     }
   };
+
   const handleSaveBanner = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSavingBanner(true);
     try {
-      const bannerRef = ref(rtdb, 'settings/banner');
-      await set(bannerRef, bannerSettings);
+      await setDoc(doc(db, 'settings', 'banner'), bannerSettings, { merge: true });
       alert('Banner settings saved successfully!');
     } catch (error: any) {
       console.warn('Error saving banner:', error);
-      alert('Failed to save banner settings.');
+      alert('Failed to save banner settings: ' + (error?.message || 'Error'));
     } finally {
       setIsSavingBanner(false);
     }
   };
-useEffect(() => {
 
-    const techniciansRef = ref(rtdb, 'technicians');
-    const unsubTech = onValue(techniciansRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        setTechnicians(Object.keys(val).map(key => ({ id: key, ...val[key] })));
+  useEffect(() => {
+    const unsubTech = onSnapshot(techniciansCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        setTechnicians(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
       } else {
         setTechnicians([]);
       }
-    });
+    }, (err) => console.warn("Firestore technicians sync note:", err));
 
-    const areaAdminsRef = ref(rtdb, 'areaAdmins');
-    const unsubAdmins = onValue(areaAdminsRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        setAreaAdmins(Object.keys(val).map(key => ({ id: key, ...val[key] })));
+    const unsubAdmins = onSnapshot(areaAdminsCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        setAreaAdmins(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
       } else {
         setAreaAdmins([]);
       }
-    });
+    }, (err) => console.warn("Firestore areaAdmins sync note:", err));
 
-    const inventoryRef = ref(rtdb, 'inventory');
-
-    const bannerRef = ref(rtdb, 'settings/banner');
-    const unsubBanner = onValue(bannerRef, (snapshot) => {
+    const unsubBanner = onSnapshot(doc(db, 'settings', 'banner'), (snapshot) => {
       if (snapshot.exists()) {
-        setBannerSettings(snapshot.val());
+        setBannerSettings(snapshot.data() as BannerSettings);
       }
-    });
+    }, (err) => console.warn("Firestore banner sync note:", err));
 
-    const pricingRef = ref(rtdb, 'settings/pricing');
-    const serviceRatesRef = ref(rtdb, 'serviceRates');
-    const unsubServiceRates = onValue(serviceRatesRef, (snapshot) => {
+    const unsubPricing = onSnapshot(doc(db, 'settings', 'pricing'), (snapshot) => {
       if (snapshot.exists()) {
-        const val = snapshot.val();
-        setServiceRates(Object.keys(val).map(key => ({ id: key, ...val[key] })));
-      } else {
-        setServiceRates([]);
+        const data = snapshot.data();
+        setPricingSettings(prev => ({ ...prev, ...data, serviceFees: { ...prev.serviceFees, ...(data?.serviceFees || {}) } }));
       }
-    });
+    }, (err) => console.warn("Firestore pricing sync note:", err));
 
-    const unsubPricing = onValue(pricingRef, (snapshot) => {
+    const unsubServiceRates = onSnapshot(doc(db, 'settings', 'serviceRates'), (snapshot) => {
       if (snapshot.exists()) {
-        const data = snapshot.val();
-        setPricingSettings(prev => ({ ...prev, ...data, serviceFees: { ...prev.serviceFees, ...(data.serviceFees || {}) } }));
+        const val = snapshot.data()?.rates || [];
+        setServiceRates(val);
       }
-    });
+    }, () => {});
 
-    const unsubInv = onValue(inventoryRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        setInventory(Object.keys(val).map(key => ({ id: key, ...val[key] })));
+    const unsubInv = onSnapshot(inventoryCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        setInventory(snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as any);
       } else {
         setInventory([]);
       }
-    });
+    }, (err) => console.warn("Firestore inventory sync note:", err));
 
-    const productsRef = ref(rtdb, 'products');
-    const unsubProducts = onValue(productsRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        setProducts(Object.keys(val).map(key => ({ id: key, ...val[key] })));
+    const unsubProducts = onSnapshot(productsCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        const fsProducts = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as Product[];
+        setProducts(fsProducts);
       } else {
         setProducts([]);
       }
+    }, (err) => {
+      console.warn("Firestore admin products sync note:", err);
+      setProducts([]);
     });
 
-    const promosRef = ref(rtdb, 'promotions');
-    const unsubPromos = onValue(promosRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        setPromotions(Object.keys(val).map(key => ({ id: key, ...val[key] })));
+    const unsubPromos = onSnapshot(promotionsCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        setPromotions(snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as any);
       } else {
         setPromotions([]);
       }
-    });
+    }, (err) => console.warn("Firestore promotions sync note:", err));
 
-    const attRef = ref(rtdb, 'attendance');
-    const unsubAttendance = onValue(attRef, (snapshot) => {
-      if (snapshot.exists()) {
-        setAttendanceRecords(snapshot.val());
+    const unsubAttendance = onSnapshot(attendanceCollection, (snapshot) => {
+      if (!snapshot.empty) {
+        const attObj: Record<string, any> = {};
+        snapshot.docs.forEach(d => {
+          attObj[d.id] = d.data();
+        });
+        setAttendanceRecords(attObj);
       } else {
         setAttendanceRecords({});
       }
-    });
+    }, (err) => console.warn("Firestore attendance sync note:", err));
 
     // Sync complaints from Cloud Firestore in real-time
     const unsubFirestoreComplaints = onSnapshot(complaintsCollection, (snapshot) => {
       if (!snapshot.empty) {
         let fsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Complaint[];
         
-        // If Area Admin, filter
-        const r = localStorage.getItem('userRole');
-        let p = [];
-        try { p = safeJSONParse(localStorage.getItem('userPincodes'), JSON.parse('[]')); } catch(e){}
-        if (r === 'area_admin' && p?.length > 0) {
-          fsData = fsData?.filter(c => c?.pincode && p?.includes(c?.pincode));
+        // In Super Admin dashboard, preserve all complaints for Super Admin
+        if (user?.role === 'area_admin' && user?.pincodes && user.pincodes.length > 0) {
+          const userPins = user.pincodes.map((pin: any) => normalizePincode(pin));
+          fsData = fsData?.filter(c => {
+            const compPin = normalizePincode(c?.pincode || (c as any)?.pinCode);
+            return compPin && userPins.includes(compPin);
+          });
         }
         
         fsData = fsData.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
         setComplaints(fsData);
+      } else {
+        setComplaints([]);
       }
     }, (error) => {
       console.warn("Error fetching Firestore complaints:", error);
     });
 
-    let unsubscribe = () => {};
-    try {
-      const complaintsRef = ref(rtdb, 'complaints');
-      unsubscribe = onValue(complaintsRef, (snapshot) => {
-        if (snapshot.exists()) {
-          const val = snapshot.val();
-          let rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
-          
-          // If Area Admin, filter
-          const r = localStorage.getItem('userRole');
-          let p = [];
-          try { p = safeJSONParse(localStorage.getItem('userPincodes'), JSON.parse('[]')); } catch(e){}
-          if (r === 'area_admin' && p?.length > 0) {
-            rtdbData = rtdbData?.filter(c => c?.pincode && p?.includes(c?.pincode));
-          }
-          
-          setComplaints(prev => {
-            const merged = [...prev, ...rtdbData];
-            const unique = [...new Map(merged.map(item => [item.id, item])).values()];
-            return unique.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-          });
-        }
-      }, () => {});
-    } catch(e) {}
-
     return () => {
       unsubFirestoreComplaints();
-      unsubscribe();
       unsubTech();
       unsubAdmins();
       unsubInv();
@@ -571,9 +520,9 @@ useEffect(() => {
 
     let validPin = '854303';
     try {
-      const snap = await get(ref(rtdb, 'superAdminConfig/masterPin'));
-      if (snap.exists() && snap.val()) {
-        validPin = String(snap.val());
+      const snap = await getDoc(doc(db, 'settings', 'superAdminConfig'));
+      if (snap.exists() && snap.data()?.masterPin) {
+        validPin = String(snap.data()?.masterPin);
       }
     } catch (err) {
       console.warn('Could not read masterPin, using default:', err);
@@ -600,7 +549,7 @@ useEffect(() => {
     }
 
     try {
-      await set(ref(rtdb, 'superAdminConfig/password'), newPassword);
+      await setDoc(doc(db, 'settings', 'superAdminConfig'), { password: newPassword }, { merge: true });
       setForgotPasswordModalOpen(false);
       alert('Password updated successfully! Please login with your new password.');
     } catch (err) {
@@ -616,9 +565,9 @@ useEffect(() => {
 
     let customSuperPassword = 'Sachin@2200';
     try {
-      const snap = await get(ref(rtdb, 'superAdminConfig/password'));
-      if (snap.exists() && snap.val()) {
-        customSuperPassword = snap.val();
+      const snap = await getDoc(doc(db, 'settings', 'superAdminConfig'));
+      if (snap.exists() && snap.data()?.password) {
+        customSuperPassword = snap.data()?.password;
       }
     } catch(e) {}
 
@@ -638,7 +587,7 @@ useEffect(() => {
     if (isSuperAdminInput && (password === 'Sachin@2200' || password === customSuperPassword)) {
       try {
         if (customSuperPassword !== 'Sachin@2200' && password === 'Sachin@2200') {
-          await set(ref(rtdb, 'superAdminConfig/password'), 'Sachin@2200');
+          await setDoc(doc(db, 'settings', 'superAdminConfig'), { password: 'Sachin@2200' }, { merge: true });
         }
       } catch(e) {}
       localStorage.setItem('userRole', 'super_admin');
@@ -660,10 +609,21 @@ useEffect(() => {
     }
 
     // Check State Area Admins
-    const adminMatch = areaAdmins?.find((a: any) => a.email === email && a.password === password);
+    const adminMatch = areaAdmins?.find((a: any) => {
+      const matchId = (a.loginId && a.loginId.toLowerCase() === email.toLowerCase()) ||
+                      (a.email && a.email.toLowerCase() === email.toLowerCase()) ||
+                      (a.phone && a.phone.trim() === email) ||
+                      (a.mobile && a.mobile.trim() === email);
+      if (!matchId) return false;
+      if (a.passwordHash && a.passwordSalt) {
+        return verifyPassword(password, a.passwordHash, a.passwordSalt);
+      }
+      return a.password === password;
+    });
+
     if (adminMatch) {
-      if (!adminMatch.isActive) {
-        setLoginError('Account is inactive.');
+      if (adminMatch.isActive === false) {
+        setLoginError('Account is inactive. Please contact Super Admin.');
         return;
       }
       localStorage.setItem('userRole', 'area_admin');
@@ -754,14 +714,13 @@ useEffect(() => {
 
     try {
       if (isEditing && isEditing.id) {
-        const productRef = ref(rtdb, 'products/' + isEditing.id);
-        update(productRef, productData as any).catch(e=>console.warn(e));
+        await updateDoc(doc(db, 'products', isEditing.id), productData);
       } else {
-        const newId = 'prod_' + Date.now();
-        set(ref(rtdb, 'products/' + newId), { ...productData, id: newId }).catch(e=>console.warn(e));
+        const newDoc = doc(productsCollection);
+        await setDoc(newDoc, { ...productData, id: newDoc.id });
       }
       resetForm();
-      
+      alert("Product saved successfully!");
     } catch (error) {
       console.error("Error saving product:", error);
       alert("Error saving product. Please try again.");
@@ -771,10 +730,8 @@ useEffect(() => {
   const handleDelete = async (id: string) => {
     if (confirm('Are you sure you want to delete this product? This action cannot be undone.')) {
       try {
-        const productRef = ref(rtdb, 'products/' + id);
-        await remove(productRef);
+        await deleteDoc(doc(db, 'products', id));
         alert('Deleted successfully');
-        
       } catch (error) {
         console.error("Error deleting product:", error);
       }
@@ -782,54 +739,210 @@ useEffect(() => {
   };
 
   
-  const handleDeleteById = (idToDelete: string, index?: number) => {
+  const handleDeleteById = async (idToDelete: string) => {
     if (window.confirm("Are you sure you want to delete this Area Admin? This action cannot be undone.")) {
       if (idToDelete) {
-        remove(ref(rtdb, 'areaAdmins/' + idToDelete)).then(() => {
+        try {
+          await deleteDoc(doc(db, 'areaAdmins', idToDelete));
           alert('Deleted successfully');
-        }).catch(e => console.warn(e));
+        } catch (e: any) {
+          console.warn('Error deleting Area Admin:', e);
+          alert('Failed to delete Area Admin: ' + (e?.message || 'Error'));
+        }
       }
     }
   };
 
-  const handleSaveAreaAdmin = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSaveAreaAdmin = async (e?: React.FormEvent) => {
+    if (e && e.preventDefault) e.preventDefault();
+    setAaFormError('');
+    const errors: { [key: string]: string } = {};
+
+    // 1. Name validation
+    const cleanName = (aaModal.name || '').trim();
+    if (!cleanName) {
+      errors.name = 'Area Admin Name is required.';
+    }
+
+    // 2. Login ID validation
+    const loginIdClean = (aaModal.loginId || '').trim();
+    if (!loginIdClean) {
+      errors.loginId = 'Login ID is required.';
+    }
+
+    // 3. Email validation
+    const cleanEmail = (aaModal.email || '').trim();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!cleanEmail) {
+      errors.email = 'Email is required.';
+    } else if (!emailRegex.test(cleanEmail)) {
+      errors.email = 'Please enter a valid email address (e.g. admin@example.com).';
+    }
+
+    // 4. Phone validation
+    const cleanPhone = (aaModal.phone || '').trim();
+    const digitsOnly = cleanPhone.replace(/[^0-9]/g, '');
+    if (!cleanPhone) {
+      errors.phone = 'Phone number is required.';
+    } else if (digitsOnly.length < 10) {
+      errors.phone = 'Please enter a valid 10-digit phone number.';
+    }
+
+    // 5. Password validation
+    const cleanPassword = (aaModal.password || '').trim();
+    if (!aaModal.id && !cleanPassword) {
+      errors.password = 'Password is required for a new Area Admin.';
+    } else if (cleanPassword && cleanPassword.length < 4) {
+      errors.password = 'Password must be at least 4 characters long.';
+    }
+
+    // 6. Assigned Pincodes validation
+    const rawPins = (aaModal.pincodes || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+    const normalizedPins = rawPins.map(s => normalizePincode(s)).filter(Boolean);
+
+    if (rawPins.length === 0 || normalizedPins.length === 0) {
+      errors.pincodes = 'Please specify at least one valid PIN Code (e.g. 20-21-02 or 209202).';
+    }
+
+    // 7. Prevent duplicate Login ID
+    if (loginIdClean) {
+      const duplicateLogin = (areaAdmins || []).find((a: any) => 
+        a.id !== aaModal.id && 
+        a.loginId && 
+        a.loginId.trim().toLowerCase() === loginIdClean.toLowerCase()
+      );
+      if (duplicateLogin) {
+        errors.loginId = `An Area Admin with Login ID "${loginIdClean}" already exists. Please choose a different Login ID.`;
+      }
+    }
+
+    if (Object.keys(errors).length > 0) {
+      setAaFieldErrors(errors);
+      const firstError = Object.values(errors)[0];
+      setAaFormError(firstError);
+      return;
+    }
+
+    setAaFieldErrors({});
+    setIsSavingAa(true);
+
     try {
-      const pins = aaModal.pincodes.split(',')?.map(s => s.trim())?.filter(s => s);
-      const data = {
-        name: aaModal.name || '',
-        email: aaModal.email || '',
-        phone: aaModal.phone || '',
-        password: aaModal.password || '',
-        pincodes: typeof (aaModal as any).assignedPincodes === 'string' ? (aaModal as any).assignedPincodes.split(',').map((p:string) => p.trim()) : (pins || []),
-        assignedPincodes: (aaModal as any).assignedPincodes || pins,
+      // Direct Firestore check to prevent race condition duplicates
+      try {
+        const checkSnap = await getDocs(areaAdminsCollection);
+        const existingList = checkSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        const duplicateInDb = existingList.find((a: any) => 
+          a.id !== aaModal.id && 
+          a.loginId && 
+          a.loginId.trim().toLowerCase() === loginIdClean.toLowerCase()
+        );
+        if (duplicateInDb) {
+          setIsSavingAa(false);
+          const dupMsg = `An Area Admin with Login ID "${loginIdClean}" already exists. Please choose a different Login ID.`;
+          setAaFieldErrors({ loginId: dupMsg });
+          setAaFormError(dupMsg);
+          return;
+        }
+      } catch (checkErr) {
+        console.warn("Firestore check duplicate note:", checkErr);
+      }
+
+      const dataToSave: Record<string, any> = {
+        name: cleanName,
+        loginId: loginIdClean,
+        email: cleanEmail,
+        phone: cleanPhone,
+        pincodes: rawPins,
+        assignedPincodes: rawPins,
+        normalizedPincodes: normalizedPins,
         permissions: {
-          canEditInventory: aaModal.canEditInventory,
-          canAlertTechs: aaModal.canAlertTechs,
-          canWA: aaModal.canWA
+          canEditInventory: aaModal.canEditInventory ?? true,
+          canAlertTechs: aaModal.canAlertTechs ?? true,
+          canWA: aaModal.canWA ?? true
         },
-        isActive: true
+        isActive: aaModal.isActive !== undefined ? aaModal.isActive : true,
+        updatedAt: new Date().toISOString()
       };
 
-      if (aaModal.id) {
-        await update(ref(rtdb, 'areaAdmins/' + aaModal.id), data);
-      } else {
-        const newId = 'admin_' + Date.now();
-        await set(ref(rtdb, 'areaAdmins/' + newId), { ...data, id: newId });
+      // Hash password if provided (never store plaintext in Firestore!)
+      if (cleanPassword) {
+        const { hash, salt } = hashPassword(cleanPassword);
+        dataToSave.passwordHash = hash;
+        dataToSave.passwordSalt = salt;
+        if (aaModal.id) {
+          dataToSave.password = deleteField();
+        }
       }
-      setAaModal({ isOpen: false, id: '', name: '', email: '', phone: '', password: '', pincodes: '', canEditInventory: true, canAlertTechs: true, canWA: true });
-      setToastMessage('Area Admin Saved Successfully');
-      setTimeout(() => setToastMessage(''), 3000);
-    } catch (e) {
-      console.error(e);
-      alert("Error saving Area Admin");
+
+      const isNew = !aaModal.id;
+      if (aaModal.id) {
+        await updateDoc(doc(db, 'areaAdmins', aaModal.id), dataToSave);
+      } else {
+        const docRef = doc(areaAdminsCollection);
+        dataToSave.id = docRef.id;
+        dataToSave.createdAt = new Date().toISOString();
+        await setDoc(docRef, dataToSave);
+      }
+
+      // Immediately refresh the Area Admin list from Firestore
+      try {
+        const freshSnap = await getDocs(areaAdminsCollection);
+        if (!freshSnap.empty) {
+          const freshList = freshSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+          setAreaAdmins(freshList);
+        }
+      } catch (refreshErr) {
+        console.warn('Error refreshing area admins after save:', refreshErr);
+      }
+
+      // Close modal and reset fields
+      setAaModal({ 
+        isOpen: false, 
+        id: '', 
+        name: '', 
+        loginId: '', 
+        email: '', 
+        phone: '', 
+        password: '', 
+        pincodes: '', 
+        isActive: true, 
+        canEditInventory: true, 
+        canAlertTechs: true, 
+        canWA: true 
+      });
+      setAaFieldErrors({});
+      setAaFormError('');
+
+      // Show clear success message
+      const successMsg = isNew ? "Area Admin added successfully" : "Area Admin updated successfully";
+      setToastMessage(successMsg);
+      setAaSuccessMessage(successMsg);
+      setTimeout(() => {
+        setToastMessage('');
+        setAaSuccessMessage('');
+      }, 4000);
+    } catch (e: any) {
+      console.error('Error saving Area Admin to Firestore:', e);
+      const errMsg = e?.message || e?.code || 'Failed to save Area Admin. Please check Firestore permissions.';
+      setAaFormError(`Firestore Error: ${errMsg}`);
+      alert(`Firestore Error: ${errMsg}`);
+    } finally {
+      setIsSavingAa(false);
     }
   };
 
   const handleToggleAreaAdminStatus = async (id: string, currentStatus: boolean) => {
     try {
-      await update(ref(rtdb, 'areaAdmins/' + id), { isActive: !currentStatus });
-    } catch (e) { console.error(e); }
+      await updateDoc(doc(db, 'areaAdmins', id), {
+        isActive: !currentStatus,
+        updatedAt: new Date().toISOString()
+      });
+    } catch (e) {
+      console.error('Error toggling Area Admin status:', e);
+    }
   };
 
   const handleSaveInventory = async (e: React.FormEvent) => {
@@ -838,23 +951,27 @@ useEffect(() => {
     const invData = {
       category: categoryToSave,
       partName: invPartName,
+      name: invPartName,
       stockQuantity: Number(invStockQuantity),
       costPrice: Number(invCostPrice),
-      sellingPrice: Number(invSellingPrice)
+      sellingPrice: Number(invSellingPrice),
+      price: Number(invSellingPrice),
+      updatedAt: new Date().toISOString()
     };
 
     try {
       if (isEditingInventory && isEditingInventory.id) {
-        const invRef = ref(rtdb, 'inventory/' + isEditingInventory.id);
-        update(invRef, invData as any).catch(e=>console.warn(e));
+        await updateDoc(doc(db, 'inventory', isEditingInventory.id), invData);
+        alert('Inventory item updated successfully!');
       } else {
-        push(ref(rtdb, 'inventory'), invData).catch(e=>console.warn(e));
+        const docRef = doc(inventoryCollection);
+        await setDoc(docRef, { ...invData, id: docRef.id, createdAt: new Date().toISOString() });
+        alert('Inventory item added successfully!');
       }
       resetInventoryForm();
-      
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error saving inventory item:", error);
-      alert("Error saving inventory item. Please try again.");
+      alert("Error saving inventory item: " + (error?.message || "Please try again."));
     }
   };
 
@@ -872,8 +989,9 @@ useEffect(() => {
       let newStatus = action;
       if (action === 'Approved') {
         const appObj = technicianApplications?.find(a => a.id === appId);
+        const docRef = doc(techniciansCollection);
         const newEntry = {
-          id: 'tech_' + Date.now().toString(),
+          id: docRef.id,
           name: name,
           mobile: phone,
           phone: phone,
@@ -886,12 +1004,12 @@ useEffect(() => {
           role: 'technician',
           createdAt: new Date().toISOString()
         };
-        await set(ref(rtdb, 'technicians/' + newEntry.id), newEntry);
+        await setDoc(docRef, newEntry);
       }
       
       try {
-        await update(ref(rtdb, 'technicianApplications/' + appId), { status: newStatus, reason });
-      } catch (e) { console.error('Firestore update failed', e); }
+        await updateDoc(doc(db, 'technicianApplications', appId), { status: newStatus, reason });
+      } catch (e) { console.error('Firestore technicianApplications update failed', e); }
       
       setToastMessage(`Technician ${action} Successfully! ✓`);
       setTimeout(() => setToastMessage(''), 3000);
@@ -903,27 +1021,31 @@ useEffect(() => {
       window.open(waUrl, '_blank');
       
       setTechAppModal({ isOpen: false, appId: '', action: '', reason: '', phone: '', name: '', loginId: '', password: '', areaAdminId: '' });
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      alert('Failed to update status');
+      alert('Failed to update status: ' + (err?.message || 'Error'));
     }
   };
 const handleAddTechnician = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      push(ref(rtdb, 'technicians'), {
+      const docRef = doc(techniciansCollection);
+      await setDoc(docRef, {
+        id: docRef.id,
         name: techName,
         phone: techPhone,
+        mobile: techPhone,
         password: techPassword,
-        isActive: true
+        isActive: true,
+        createdAt: new Date().toISOString()
       });
       setTechName('');
       setTechPhone('');
       setTechPassword('');
-      
-    } catch (error) {
+      alert("Technician added successfully!");
+    } catch (error: any) {
       console.error("Error adding technician:", error);
-      alert("Failed to add technician.");
+      alert("Failed to add technician: " + (error?.message || "Error"));
     }
   };
 
@@ -931,60 +1053,49 @@ const handleAddTechnician = async (e: React.FormEvent) => {
     const newPassword = prompt("Enter new password for technician:");
     if (newPassword) {
       try {
-        const techRef = ref(rtdb, 'technicians/' + id);
-        update(techRef, { password: newPassword }).catch(e=>console.warn(e));
+        await updateDoc(doc(db, 'technicians', id), { password: newPassword });
         alert("Password updated successfully.");
-        
-      } catch (error) {
+      } catch (error: any) {
         console.error("Error updating password:", error);
-        alert("Failed to update password.");
+        alert("Failed to update password: " + (error?.message || "Error"));
       }
     }
   };
 
   const handleAssignTechnician = async (complaintId: string, technicianId: string) => {
     try {
-      const complaintRef = ref(rtdb, 'complaints/' + complaintId);
       const tech = technicians?.find(t => t.id === technicianId);
       const techName = tech ? tech?.name : (technicianId || '');
       
-      // Update RTDB if active
-      update(complaintRef, {
-        assignedTechnicianId: technicianId,
-        assignedTechnicianName: techName,
-        assignedTo: techName,
-        status: 'ALERT SENT / ASSIGNED'
-      }).catch(() => {});
-
       // Update Cloud Firestore
-      updateDoc(doc(db, 'complaints', complaintId), {
+      await updateDoc(doc(db, 'complaints', complaintId), {
         assignedTechnicianId: technicianId,
         assignedTechnicianName: techName,
         assignedTo: techName,
-        status: 'ALERT SENT / ASSIGNED'
-      }).catch((e) => console.warn('Firestore assign note:', e));
+        status: 'ALERT SENT / ASSIGNED',
+        updatedAt: new Date().toISOString()
+      });
 
       // Instant React State Update
       setComplaints(prev => prev?.map(c => c.id === complaintId ? { ...c, assignedTechnicianId: technicianId, assignedTechnicianName: techName, assignedTo: techName, status: 'ALERT SENT / ASSIGNED' } : c));
       
-      // Temporary green success popup
+      // Green success popup
       setToastMessage(`Alert sent to Technician ${techName} successfully!`);
       setTimeout(() => setToastMessage(''), 4000);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error assigning technician:", error);
-      alert("Failed to assign technician.");
+      alert("Failed to assign technician: " + (error?.message || "Error"));
     }
   };
 
   const handleDeleteInventory = async (id: string) => {
     if (confirm('Are you sure you want to delete this inventory item? This action cannot be undone.')) {
       try {
-        const invRef = ref(rtdb, 'inventory/' + id);
-        await remove(invRef);
+        await deleteDoc(doc(db, 'inventory', id));
         alert('Deleted successfully');
-        
-      } catch (error) {
+      } catch (error: any) {
         console.error("Error deleting inventory item:", error);
+        alert('Failed to delete inventory item: ' + (error?.message || 'Error'));
       }
     }
   };
@@ -997,10 +1108,8 @@ const handleAddTechnician = async (e: React.FormEvent) => {
     }
 
     try {
-      const complaintRef = ref(rtdb, 'complaints/' + id);
-      update(complaintRef, { status: 'Pending' }).catch(() => {});
-      updateDoc(doc(db, 'complaints', id), { status: 'Pending' }).catch(() => {});
-    } catch (error) {
+      await updateDoc(doc(db, 'complaints', id), { status: 'Pending', updatedAt: new Date().toISOString() });
+    } catch (error: any) {
       console.error("Error updating complaint:", error);
     }
   };
@@ -1020,14 +1129,11 @@ const handleAddTechnician = async (e: React.FormEvent) => {
           if (replacedPartName) {
             finalReplacedPartName += ` - ${replacedPartName}`;
           }
-          // Deduct stock
+          // Deduct stock in Firestore
           if (selectedItem.stockQuantity > 0) {
-            const invRef = ref(rtdb, 'inventory/' + selectedItem.id);
-            await update(invRef, {
+            await updateDoc(doc(db, 'inventory', selectedItem.id), {
               stockQuantity: selectedItem.stockQuantity - 1
             });
-            // Background fetch inventory
-            
           }
         }
       }
@@ -1043,12 +1149,11 @@ const handleAddTechnician = async (e: React.FormEvent) => {
           warrantyDays: Number(DOMPurify.sanitize(warrantyDays.toString())),
           resolutionDate: new Date().toISOString(),
           paymentStatus
-        }
+        },
+        updatedAt: new Date().toISOString()
       };
 
-      const complaintRef = ref(rtdb, 'complaints/' + resolvingComplaintId);
-      update(complaintRef, resolutionData).catch(() => {});
-      updateDoc(doc(db, 'complaints', resolvingComplaintId), resolutionData).catch(() => {});
+      await updateDoc(doc(db, 'complaints', resolvingComplaintId), resolutionData);
       
       setResolutionModalOpen(false);
       setResolvingComplaintId(null);
@@ -1060,9 +1165,9 @@ const handleAddTechnician = async (e: React.FormEvent) => {
       setSerialNumber('');
       setWarrantyDays('30');
       setPaymentStatus('Paid');
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error resolving complaint:", error);
-      alert("Failed to resolve complaint");
+      alert("Failed to resolve complaint: " + (error?.message || "Error"));
     }
   };
 
@@ -1125,28 +1230,34 @@ const handleAddTechnician = async (e: React.FormEvent) => {
   };
 
 
-  const handleDeleteComplaint = (id: string) => {
+  const handleDeleteComplaint = async (id: string) => {
     if (window.confirm('Are you sure you want to delete this complaint? This action cannot be undone.')) {
-      deleteDoc(doc(db, 'complaints', id)).catch(() => {});
-      remove(ref(rtdb, 'complaints/' + id)).then(() => {
+      try {
+        await deleteDoc(doc(db, 'complaints', id));
+        setComplaints(prev => prev.filter(c => c.id !== id));
         alert('Deleted successfully');
-      }).catch(e => {
-        console.warn('Error deleting complaint from RTDB', e);
-        alert('Deleted successfully');
-      });
-      setComplaints(prev => prev.filter(c => c.id !== id));
+      } catch (e: any) {
+        console.warn('Error deleting complaint:', e);
+        alert('Failed to delete complaint: ' + (e?.message || 'Error'));
+      }
     }
   };
 
   const handleAssignAreaAdmin = async (complaintId: string, areaAdminId: string, adminName: string) => {
     try {
-      updateDoc(doc(db, 'complaints', complaintId), { assignedAreaAdminId: areaAdminId, autoRouted: false }).catch(() => {});
-      const complaintRef = ref(rtdb, 'complaints/' + complaintId);
-      await update(complaintRef, { assignedAreaAdminId: areaAdminId, autoRouted: false });
+      // Primary write: Cloud Firestore
+      await updateDoc(doc(db, 'complaints', complaintId), { 
+        assignedAreaAdminId: areaAdminId, 
+        autoRouted: false,
+        updatedAt: new Date().toISOString()
+      });
+
+      // Update React state immediately
+      setComplaints(prev => prev.map(c => c.id === complaintId ? { ...c, assignedAreaAdminId: areaAdminId, autoRouted: false } : c));
       alert(`Complaint manually assigned to ${adminName}`);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error assigning area admin:", err);
-      alert(`Complaint assigned to ${adminName}`);
+      alert(`Failed to assign area admin: ${err?.message || 'Error occurred'}`);
     }
   };
   
@@ -1160,8 +1271,6 @@ const handleAddTechnician = async (e: React.FormEvent) => {
     if (!updatingComplaintId || !updatingComplaintData) return;
 
     try {
-      const complaintRef = ref(rtdb, 'complaints/' + updatingComplaintId);
-      
       const sanitizedStatus = DOMPurify.sanitize(customStatus);
       const sanitizedRemark = DOMPurify.sanitize(customRemark);
       const newUpdate = {
@@ -1172,20 +1281,20 @@ const handleAddTechnician = async (e: React.FormEvent) => {
       
       const currentUpdates = updatingComplaintData.statusUpdates || [];
       
-      await update(complaintRef, {
+      await updateDoc(doc(db, 'complaints', updatingComplaintId), {
         status: sanitizedStatus,
-        statusUpdates: [...currentUpdates, newUpdate]
+        statusUpdates: [...currentUpdates, newUpdate],
+        updatedAt: new Date().toISOString()
       });
-      
       
       setUpdateStatusModalOpen(false);
       setUpdatingComplaintId(null);
       setUpdatingComplaintData(null);
       setCustomStatus('In Progress');
       setCustomRemark('');
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error updating complaint status:", error);
-      alert("Failed to update status");
+      alert("Failed to update status: " + (error?.message || "Error"));
     }
   };
 
@@ -1206,24 +1315,27 @@ const handleAddTechnician = async (e: React.FormEvent) => {
         subtitle: promoSubtitle,
         imageUrl: promoImageUrl,
         order: promoOrder,
-        isActive: promoIsActive
+        isActive: promoIsActive,
+        updatedAt: new Date().toISOString()
       };
 
       if (isEditingPromo?.id) {
-        update(ref(rtdb, 'promotions/' + isEditingPromo.id), promoData as any).catch(e=>console.warn(e));
+        await updateDoc(doc(db, 'promotions', isEditingPromo.id), promoData);
+        alert('Promotion updated successfully!');
       } else {
-        const newId = 'promo_' + Date.now();
-        set(ref(rtdb, 'promotions/' + newId), { ...promoData, id: newId }).catch(e=>console.warn(e));
+        const docRef = doc(promotionsCollection);
+        await setDoc(docRef, { ...promoData, id: docRef.id, createdAt: new Date().toISOString() });
+        alert('Promotion added successfully!');
       }
-setPromoTitle('');
+      setPromoTitle('');
       setPromoSubtitle('');
       setPromoImageUrl('');
       setPromoOrder(promotions?.length + 1);
       setPromoIsActive(true);
       setIsEditingPromo(null);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error saving promo:", error);
-      alert("Failed to save promotion. Check console.");
+      alert("Failed to save promotion: " + (error?.message || "Error"));
     } finally {
       setIsSavingPromo(false);
     }
@@ -1241,12 +1353,11 @@ setPromoTitle('');
   const handleDeletePromo = async (id: string) => {
     if (confirm('Are you sure you want to delete this promotion? This action cannot be undone.')) {
       try {
-        await remove(ref(rtdb, 'promotions/' + id));
+        await deleteDoc(doc(db, 'promotions', id));
         alert('Deleted successfully');
-        
-      } catch (error) {
+      } catch (error: any) {
         console.error("Error deleting promotion:", error);
-        alert("Failed to delete. Check console.");
+        alert("Failed to delete promotion: " + (error?.message || "Error"));
       }
     }
   };
@@ -1666,25 +1777,25 @@ setPromoTitle('');
                 <p className="text-sm text-slate-500">Create and manage regional administrators.</p>
               </div>
               <div className="flex gap-3">
-                <button
-                  onClick={() => {
-                    if (window.confirm("WARNING: This will delete ALL data from localStorage and reset the app. Are you sure?")) {
-                      localStorage.clear();
-                      window.location.reload();
-                    }
-                  }}
-                  className="flex items-center gap-2 bg-red-600 text-white px-5 py-2.5 rounded-lg font-bold hover:bg-red-700 transition-colors shadow-sm"
-                >
-                  ⚠️ Reset App
-                </button>
                 <button 
-                  onClick={() => setAaModal({ isOpen: true, id: '', name: '', email: '', phone: '', password: '', pincodes: '', canEditInventory: true, canAlertTechs: true, canWA: true })}
+                  onClick={() => {
+                    setAaModal({ isOpen: true, id: '', name: '', loginId: '', email: '', phone: '', password: '', pincodes: '', isActive: true, canEditInventory: true, canAlertTechs: true, canWA: true });
+                    setAaFieldErrors({});
+                    setAaFormError('');
+                  }}
                   className="flex items-center gap-2 bg-blue-600 text-white px-5 py-2.5 rounded-lg font-bold hover:bg-blue-700 transition-colors shadow-sm"
                 >
                   + Add New Area Admin
                 </button>
               </div>
             </div>
+
+            {aaSuccessMessage && (
+              <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 px-5 py-3.5 rounded-xl flex items-center gap-2.5 font-bold shadow-sm animate-fadeIn">
+                <CheckCircle className="w-5 h-5 text-emerald-600 shrink-0" />
+                <span>{aaSuccessMessage}</span>
+              </div>
+            )}
 
             <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
               <div className="px-6 py-4 border-b border-slate-200 bg-slate-50">
@@ -1698,22 +1809,36 @@ setPromoTitle('');
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-                    {areaAdmins?.map((admin, index) => (
+                    {areaAdmins?.map((admin) => (
                       <div key={admin.id} className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
                         <div className="p-5 flex-1">
                           <div className="flex justify-between items-start mb-4">
                             <div>
                               <h4 className="font-bold text-slate-900 text-lg">{admin.name}</h4>
-                              <div className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-50 text-blue-700 mt-1">
+                              {admin.loginId && (
+                                <p className="text-xs font-mono text-slate-500 mt-0.5">ID: {admin.loginId}</p>
+                              )}
+                              <div className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium mt-1 ${
+                                admin.isActive !== false ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'
+                              }`}>
                                 {admin.isActive !== false ? 'Active' : 'Inactive'}
                               </div>
                             </div>
+                            <button
+                              type="button"
+                              onClick={() => handleToggleAreaAdminStatus(admin.id, admin.isActive !== false)}
+                              className={`px-2.5 py-1 rounded text-xs font-semibold border transition-colors ${
+                                admin.isActive !== false ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 border-amber-200' : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-emerald-200'
+                              }`}
+                            >
+                              {admin.isActive !== false ? 'Deactivate' : 'Activate'}
+                            </button>
                           </div>
                           
                           <div className="space-y-3">
                             <div className="flex items-center gap-2 text-sm text-slate-600">
                               <span className="shrink-0 w-5 h-5 flex items-center justify-center bg-slate-100 rounded text-slate-400">📧</span>
-                              <span className="truncate">{admin.email}</span>
+                              <span className="truncate">{admin.email || 'N/A'}</span>
                             </div>
                             <div className="flex items-center gap-2 text-sm text-slate-600">
                               <span className="shrink-0 w-5 h-5 flex items-center justify-center bg-slate-100 rounded text-slate-400">📱</span>
@@ -1722,8 +1847,8 @@ setPromoTitle('');
                             <div className="flex gap-2 text-sm text-slate-600 items-start">
                               <span className="shrink-0 w-5 h-5 flex items-center justify-center bg-slate-100 rounded text-slate-400 mt-0.5">📍</span>
                               <div className="flex flex-wrap gap-1">
-                                {admin.pincodes && admin.pincodes?.map((pin: string) => (
-                                  <span key={pin} className="inline-flex px-2 py-1 bg-slate-100 text-slate-700 rounded text-xs font-medium border border-slate-200">
+                                {(admin.pincodes || admin.assignedPincodes || []).map((pin: string) => (
+                                  <span key={pin} className="inline-flex px-2 py-1 bg-slate-100 text-slate-700 rounded text-xs font-medium border border-slate-200 font-mono">
                                     {pin}
                                   </span>
                                 ))}
@@ -1735,7 +1860,7 @@ setPromoTitle('');
                         <div className="border-t border-slate-100 bg-slate-50 p-3 flex flex-wrap items-center justify-between gap-2">
                           <button 
                             onClick={() => setViewingAdminComplaints(admin)}
-                            className="flex-1 min-w-[140px] flex items-center justify-center gap-1.5 px-3 py-2 bg-white border border-slate-200 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-blue-600 transition-colors shadow-sm"
+                            className="flex-1 min-w-[130px] flex items-center justify-center gap-1.5 px-3 py-2 bg-white border border-slate-200 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-blue-600 transition-colors shadow-sm"
                           >
                             👁️ View Complaints
                           </button>
@@ -1745,15 +1870,19 @@ setPromoTitle('');
                                 setAaModal({
                                   isOpen: true,
                                   id: admin.id,
-                                  name: admin.name,
-                                  email: admin.email,
-                                  phone: admin.phone,
-                                  password: admin.password || '',
-                                  pincodes: admin.pincodes ? admin.pincodes?.join(', ') : '',
+                                  name: admin.name || '',
+                                  loginId: admin.loginId || admin.email || admin.phone || '',
+                                  email: admin.email || '',
+                                  phone: admin.phone || '',
+                                  password: '',
+                                  pincodes: Array.isArray(admin.pincodes) ? admin.pincodes.join(', ') : (admin.pincodes || ''),
+                                  isActive: admin.isActive !== false,
                                   canEditInventory: admin.permissions?.canEditInventory ?? true,
                                   canAlertTechs: admin.permissions?.canAlertTechs ?? true,
                                   canWA: admin.permissions?.canWA ?? true
                                 });
+                                setAaFieldErrors({});
+                                setAaFormError('');
                               }}
                               className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-2 bg-white border border-slate-200 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-50 hover:text-slate-900 transition-colors shadow-sm"
                             >
@@ -1764,9 +1893,7 @@ setPromoTitle('');
                               onClick={(e) => {
                                 e.preventDefault();
                                 e.stopPropagation();
-                                if (window.confirm("Are you sure you want to delete this Area Admin? This action cannot be undone.")) {
-                                  handleDeleteById(admin.id, index);
-                                }
+                                handleDeleteById(admin.id);
                               }}
                               className="px-4 py-2 bg-red-50 text-red-600 rounded-lg hover:bg-red-100 font-medium transition-colors border border-red-200"
                             >
@@ -2269,20 +2396,18 @@ setPromoTitle('');
                         </td>
                         <td className="py-4 px-6 text-right">
                           <div className="flex justify-end gap-2 text-xs font-semibold">
-                            <button className="px-3 py-1.5 text-slate-600 hover:text-blue-700 hover:bg-blue-50 rounded-md border border-slate-200 transition-colors bg-white shadow-sm">
+                            <button 
+                              onClick={() => handleEditTech(tech)}
+                              className="px-3 py-1.5 text-slate-600 hover:text-blue-700 hover:bg-blue-50 rounded-md border border-slate-200 transition-colors bg-white shadow-sm">
                               ✏️ Edit Details
                             </button>
-                            <button className="px-3 py-1.5 text-slate-600 hover:text-amber-700 hover:bg-amber-50 rounded-md border border-slate-200 transition-colors bg-white shadow-sm">
+                            <button 
+                              onClick={() => handleResetTechPassword(tech.id)}
+                              className="px-3 py-1.5 text-slate-600 hover:text-amber-700 hover:bg-amber-50 rounded-md border border-slate-200 transition-colors bg-white shadow-sm">
                               🔑 Reset Password
                             </button>
                             <button 
-                              onClick={() => {
-                                if(confirm('Are you sure you want to delete this technician? This action cannot be undone.')) {
-                                  if (tech?.id) {
-                                    remove(ref(rtdb, 'technicians/' + tech.id)).then(() => alert('Deleted successfully')).catch((e) => console.warn(e));
-                                  }
-                                }
-                              }}
+                              onClick={() => handleDeleteActiveTech(tech.id)}
                               className="px-3 py-1.5 text-slate-600 hover:text-red-700 hover:bg-red-50 rounded-md border border-slate-200 transition-colors bg-white shadow-sm">
                               🗑️ Delete Tech
                             </button>
@@ -2894,8 +3019,12 @@ setPromoTitle('');
             </div>
             <div className="p-6 overflow-y-auto flex-1">
               {(() => {
-                const adminComplaints = complaints?.filter(c => viewingAdminComplaints.pincodes?.includes(c?.pincode));
-                if (adminComplaints?.length === 0) {
+                const adminPins = (viewingAdminComplaints.pincodes || viewingAdminComplaints.assignedPincodes || []).map((p: any) => normalizePincode(p)).filter(Boolean);
+                const adminComplaints = complaints?.filter(c => {
+                  const compPin = normalizePincode(c?.pincode || c?.pinCode);
+                  return compPin && adminPins.includes(compPin);
+                });
+                if (!adminComplaints || adminComplaints.length === 0) {
                   return <div className="text-center text-slate-500 mt-10">No complaints found for these pincodes.</div>;
                 }
                 return (
@@ -2939,31 +3068,153 @@ setPromoTitle('');
       {aaModal.isOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm px-4">
           <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto">
-            <h3 className="text-xl font-bold text-slate-900 mb-4">{aaModal.id ? 'Edit' : 'Add'} Area Admin</h3>
-            <form onSubmit={handleSaveAreaAdmin} className="space-y-4">
+            <h3 className="text-xl font-bold text-slate-900 mb-4">{aaModal.id ? 'Edit Area Admin' : 'Add New Area Admin'}</h3>
+            <form onSubmit={handleSaveAreaAdmin} noValidate className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Name</label>
-                <input required type="text" value={aaModal.name} onChange={e => setAaModal({...aaModal, name: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md" />
+                <label className="block text-sm font-semibold text-slate-700 mb-1">
+                  Area Admin Name <span className="text-rose-500">*</span>
+                </label>
+                <input 
+                  type="text" 
+                  value={aaModal.name} 
+                  onChange={e => {
+                    setAaModal({...aaModal, name: e.target.value});
+                    if (aaFieldErrors.name) setAaFieldErrors(prev => ({ ...prev, name: '' }));
+                  }} 
+                  className={`w-full px-3 py-2 border rounded-lg text-sm outline-none transition-colors ${
+                    aaFieldErrors.name ? 'border-rose-500 focus:ring-2 focus:ring-rose-500 bg-rose-50/20' : 'border-slate-300 focus:ring-2 focus:ring-blue-500'
+                  }`} 
+                  placeholder="e.g. Loyalty or Bilhaur Admin" 
+                />
+                {aaFieldErrors.name && (
+                  <p className="text-xs text-rose-600 mt-1 font-medium">{aaFieldErrors.name}</p>
+                )}
               </div>
+
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Login ID (Email)</label>
-                <input required type="email" value={aaModal.email} onChange={e => setAaModal({...aaModal, email: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md" />
+                <label className="block text-sm font-semibold text-slate-700 mb-1">
+                  Login ID <span className="text-rose-500">*</span>
+                </label>
+                <input 
+                  type="text" 
+                  value={aaModal.loginId} 
+                  onChange={e => {
+                    setAaModal({...aaModal, loginId: e.target.value});
+                    if (aaFieldErrors.loginId) setAaFieldErrors(prev => ({ ...prev, loginId: '' }));
+                  }} 
+                  className={`w-full px-3 py-2 border rounded-lg text-sm outline-none font-mono transition-colors ${
+                    aaFieldErrors.loginId ? 'border-rose-500 focus:ring-2 focus:ring-rose-500 bg-rose-50/20' : 'border-slate-300 focus:ring-2 focus:ring-blue-500'
+                  }`} 
+                  placeholder="e.g. loyalty or 8470984205" 
+                />
+                <p className="text-[11px] text-slate-500 mt-0.5">Used by the Area Admin to sign in to the regional portal.</p>
+                {aaFieldErrors.loginId && (
+                  <p className="text-xs text-rose-600 mt-1 font-medium">{aaFieldErrors.loginId}</p>
+                )}
               </div>
+
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Phone</label>
-                <input required type="text" value={aaModal.phone} onChange={e => setAaModal({...aaModal, phone: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md" />
+                <label className="block text-sm font-semibold text-slate-700 mb-1">
+                  Password {!aaModal.id && <span className="text-rose-500">*</span>}
+                </label>
+                <input 
+                  type="password" 
+                  value={aaModal.password} 
+                  onChange={e => {
+                    setAaModal({...aaModal, password: e.target.value});
+                    if (aaFieldErrors.password) setAaFieldErrors(prev => ({ ...prev, password: '' }));
+                  }} 
+                  className={`w-full px-3 py-2 border rounded-lg text-sm outline-none transition-colors ${
+                    aaFieldErrors.password ? 'border-rose-500 focus:ring-2 focus:ring-rose-500 bg-rose-50/20' : 'border-slate-300 focus:ring-2 focus:ring-blue-500'
+                  }`} 
+                  placeholder={aaModal.id ? "Leave blank to keep current password, or enter new password to reset" : "Enter password (stored securely hashed)"} 
+                />
+                {aaModal.id && (
+                  <p className="text-[11px] text-slate-500 mt-0.5">To change or reset password, enter a new one. Leave blank to keep existing.</p>
+                )}
+                {aaFieldErrors.password && (
+                  <p className="text-xs text-rose-600 mt-1 font-medium">{aaFieldErrors.password}</p>
+                )}
               </div>
+
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
-                <input required={!aaModal.id} type="text" value={aaModal.password} onChange={e => setAaModal({...aaModal, password: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md" placeholder={aaModal.id ? "Leave blank to keep current" : ""} />
+                <label className="block text-sm font-semibold text-slate-700 mb-1">
+                  Assigned PIN Code / Area <span className="text-rose-500">*</span>
+                </label>
+                <input 
+                  type="text" 
+                  value={aaModal.pincodes} 
+                  onChange={e => {
+                    setAaModal({...aaModal, pincodes: e.target.value});
+                    if (aaFieldErrors.pincodes) setAaFieldErrors(prev => ({ ...prev, pincodes: '' }));
+                  }} 
+                  className={`w-full px-3 py-2 border rounded-lg text-sm outline-none font-mono transition-colors ${
+                    aaFieldErrors.pincodes ? 'border-rose-500 focus:ring-2 focus:ring-rose-500 bg-rose-50/20' : 'border-slate-300 focus:ring-2 focus:ring-blue-500'
+                  }`} 
+                  placeholder="e.g. 20-21-02 or 209202, 208001" 
+                />
+                <p className="text-[11px] text-slate-500 mt-0.5">Format can be standard 209202 or formatted 20-21-02. Separate multiple PINs with commas.</p>
+                {aaFieldErrors.pincodes && (
+                  <p className="text-xs text-rose-600 mt-1 font-medium">{aaFieldErrors.pincodes}</p>
+                )}
               </div>
-              <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1">Assigned Pincodes (comma-separated)</label>
-                <input required type="text" value={aaModal.pincodes} onChange={e => setAaModal({...aaModal, pincodes: e.target.value})} className="w-full px-3 py-2 border border-slate-300 rounded-md" placeholder="e.g. 209202, 209203" />
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-1">
+                    Phone Number <span className="text-rose-500">*</span>
+                  </label>
+                  <input 
+                    type="tel" 
+                    value={aaModal.phone} 
+                    onChange={e => {
+                      setAaModal({...aaModal, phone: e.target.value});
+                      if (aaFieldErrors.phone) setAaFieldErrors(prev => ({ ...prev, phone: '' }));
+                    }} 
+                    className={`w-full px-3 py-2 border rounded-lg text-sm outline-none transition-colors ${
+                      aaFieldErrors.phone ? 'border-rose-500 focus:ring-2 focus:ring-rose-500 bg-rose-50/20' : 'border-slate-300 focus:ring-2 focus:ring-blue-500'
+                    }`} 
+                    placeholder="e.g. 9876543210" 
+                  />
+                  {aaFieldErrors.phone && (
+                    <p className="text-xs text-rose-600 mt-1 font-medium">{aaFieldErrors.phone}</p>
+                  )}
+                </div>
+
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-1">
+                    Email Address <span className="text-rose-500">*</span>
+                  </label>
+                  <input 
+                    type="email" 
+                    value={aaModal.email} 
+                    onChange={e => {
+                      setAaModal({...aaModal, email: e.target.value});
+                      if (aaFieldErrors.email) setAaFieldErrors(prev => ({ ...prev, email: '' }));
+                    }} 
+                    className={`w-full px-3 py-2 border rounded-lg text-sm outline-none transition-colors ${
+                      aaFieldErrors.email ? 'border-rose-500 focus:ring-2 focus:ring-rose-500 bg-rose-50/20' : 'border-slate-300 focus:ring-2 focus:ring-blue-500'
+                    }`} 
+                    placeholder="e.g. loyalty@sachin.com" 
+                  />
+                  {aaFieldErrors.email && (
+                    <p className="text-xs text-rose-600 mt-1 font-medium">{aaFieldErrors.email}</p>
+                  )}
+                </div>
+              </div>
+              
+              <div className="pt-2">
+                <label className="flex items-center gap-2.5 cursor-pointer p-2.5 bg-slate-50 rounded-lg border border-slate-200">
+                  <input type="checkbox" checked={aaModal.isActive} onChange={e => setAaModal({...aaModal, isActive: e.target.checked})} className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4" />
+                  <div>
+                    <span className="text-sm font-bold text-slate-800">Account Active</span>
+                    <p className="text-xs text-slate-500">Enable or disable login access and automatic regional complaint routing.</p>
+                  </div>
+                </label>
               </div>
               
               <div className="space-y-2 mt-4 pt-4 border-t border-slate-100">
-                <h4 className="font-medium text-sm text-slate-900">Permissions</h4>
+                <h4 className="font-semibold text-sm text-slate-900">Regional Permissions</h4>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={aaModal.canEditInventory} onChange={e => setAaModal({...aaModal, canEditInventory: e.target.checked})} className="rounded text-blue-600 focus:ring-blue-500" />
                   <span className="text-sm text-slate-700">Can Edit Local Inventory</span>
@@ -2978,9 +3229,34 @@ setPromoTitle('');
                 </label>
               </div>
 
+              {aaFormError && (
+                <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-rose-700 text-sm font-medium flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-rose-500 mt-0.5" />
+                  <div className="flex-1">{aaFormError}</div>
+                </div>
+              )}
+
               <div className="flex gap-3 pt-4">
-                <button type="button" onClick={() => setAaModal({...aaModal, isOpen: false})} className="flex-1 bg-slate-100 text-slate-700 font-bold py-2 px-4 rounded-md hover:bg-slate-200">Cancel</button>
-                <button type="submit" className="flex-1 bg-blue-600 text-white font-bold py-2 px-4 rounded-md hover:bg-blue-700">Save Admin</button>
+                <button 
+                  type="button" 
+                  onClick={() => {
+                    setAaModal({...aaModal, isOpen: false});
+                    setAaFieldErrors({});
+                    setAaFormError('');
+                  }} 
+                  className="flex-1 bg-slate-100 text-slate-700 font-bold py-2.5 px-4 rounded-lg hover:bg-slate-200 transition-colors text-sm"
+                >
+                  Cancel
+                </button>
+                <button 
+                  type="submit" 
+                  id="save-admin-btn"
+                  data-testid="save-admin-button"
+                  disabled={isSavingAa}
+                  className="flex-1 bg-blue-600 text-white font-bold py-2.5 px-4 rounded-lg hover:bg-blue-700 transition-colors shadow-sm text-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  {isSavingAa ? 'Saving Admin...' : 'Save Admin'}
+                </button>
               </div>
             </form>
           </div>

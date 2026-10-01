@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { ref, onValue } from 'firebase/database';
-import { rtdb } from '../../lib/firebase';
+import { onSnapshot } from 'firebase/firestore';
+import { complaintsCollection, ordersCollection, techniciansCollection } from '../../lib/firebase';
 import { Complaint, Order, Technician } from '../../types';
 import {
   FileSpreadsheet,
@@ -84,59 +84,72 @@ export default function AnalyticsReportsDashboard() {
   // Selected Record Modal Details
   const [viewingRecord, setViewingRecord] = useState<UnifiedRecord | null>(null);
 
-  // Real-time Firebase RTDB Listeners
+  // Real-time Cloud Firestore Listeners
   useEffect(() => {
     setLoading(true);
 
     // 1. Complaints Listener (Repairs across all appliances)
-    const complaintsRef = ref(rtdb, 'complaints');
-    const unsubComplaints = onValue(complaintsRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const list: Complaint[] = Object.keys(val).map((k) => ({
-          id: k,
-          ...val[k]
-        }));
-        setComplaints(list);
-      } else {
-        setComplaints([]);
+    const unsubComplaints = onSnapshot(
+      complaintsCollection,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const list: Complaint[] = snapshot.docs.map((doc) => ({
+            id: doc.id,
+            ...doc.data()
+          })) as Complaint[];
+          setComplaints(list);
+        } else {
+          setComplaints([]);
+        }
+        setLastRefreshed(new Date());
+      },
+      (err) => {
+        console.warn('Firestore complaints sync note in AnalyticsReportsDashboard:', err);
       }
-      setLastRefreshed(new Date());
-    });
+    );
 
     // 2. Orders Listener (Product purchases & spare parts)
-    const ordersRef = ref(rtdb, 'orders');
-    const unsubOrders = onValue(ordersRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const list: Order[] = Object.keys(val).map((k) => ({
-          id: k,
-          orderId: val[k].orderId || k,
-          ...val[k]
-        }));
-        setOrders(list);
-      } else {
-        setOrders([]);
+    const unsubOrders = onSnapshot(
+      ordersCollection,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const list: Order[] = snapshot.docs.map((doc) => ({
+            id: doc.id,
+            orderId: doc.data().orderId || doc.id,
+            ...doc.data()
+          })) as Order[];
+          setOrders(list);
+        } else {
+          setOrders([]);
+        }
+        setLastRefreshed(new Date());
+      },
+      (err) => {
+        console.warn('Firestore orders sync note in AnalyticsReportsDashboard:', err);
       }
-      setLastRefreshed(new Date());
-    });
+    );
 
     // 3. Technicians Listener
-    const techniciansRef = ref(rtdb, 'technicians');
-    const unsubTech = onValue(techniciansRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const val = snapshot.val();
-        const list: Technician[] = Object.keys(val).map((k) => ({
-          id: k,
-          ...val[k]
-        }));
-        setTechnicians(list);
-      } else {
-        setTechnicians([]);
+    const unsubTech = onSnapshot(
+      techniciansCollection,
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const list: Technician[] = snapshot.docs.map((doc) => ({
+            id: doc.id,
+            ...doc.data()
+          })) as Technician[];
+          setTechnicians(list);
+        } else {
+          setTechnicians([]);
+        }
+        setLastRefreshed(new Date());
+        setLoading(false);
+      },
+      (err) => {
+        console.warn('Firestore technicians sync note in AnalyticsReportsDashboard:', err);
+        setLoading(false);
       }
-      setLastRefreshed(new Date());
-      setLoading(false);
-    });
+    );
 
     return () => {
       unsubComplaints();

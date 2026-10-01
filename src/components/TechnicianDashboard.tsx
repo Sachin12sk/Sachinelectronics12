@@ -1,10 +1,8 @@
-import { ref, get, update, push, set, onValue } from 'firebase/database';
-import { rtdb } from '../lib/firebase';
 import React, { useState, useEffect } from 'react';
 import { useGlobalState } from "../context/GlobalContext";
 import ErrorBoundary from "./ErrorBoundary";
-import { db, complaintsCollection, techniciansCollection, inventoryCollection } from '../lib/firebase';
-import { onSnapshot, updateDoc, doc } from 'firebase/firestore';
+import { db, complaintsCollection, techniciansCollection, inventoryCollection, leavesCollection, attendanceCollection } from '../lib/firebase';
+import { onSnapshot, updateDoc, doc, getDocs, setDoc, getDoc } from 'firebase/firestore';
 
 import { Complaint, Technician, InventoryItem } from '../types';
 import { LogOut, Check, Camera, Wrench, Search, Package, FileText, Download, MapPin, MessageCircle, ScanLine, Clock, PlayCircle, Square, Briefcase, Calendar } from 'lucide-react';
@@ -81,24 +79,25 @@ function InnerTechnicianDashboard() {
     setCurrentMonthDays(days);
     
     if (tech) {
-      const attRef = ref(rtdb, 'attendance');
-      const unsubAtt = onValue(attRef, (snapshot) => {
-        if (snapshot.exists()) {
-          const val = snapshot.val();
-          const allAttendance = Object.keys(val).map(key => ({ id: key, ...val[key] }));
-          setAttendance(allAttendance.filter(a => a.techId === tech.id));
+      const unsubAtt = onSnapshot(attendanceCollection, (snapshot) => {
+        if (!snapshot.empty) {
+          const allAttendance = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          setAttendance(allAttendance.filter((a: any) => a.techId === tech.id));
+        } else {
+          setAttendance([]);
         }
-      });
-      const leavesRef = ref(rtdb, 'leaves');
-      const unsubLeaves = onValue(leavesRef, (snapshot) => {
-        if (snapshot.exists()) {
-          const val = snapshot.val();
-          const allLeaves = Object.keys(val).map(key => ({ id: key, ...val[key] }));
-          setLeaves(allLeaves.filter(l => l.techId === tech.id));
+      }, (err) => console.warn('Attendance sync note:', err));
+
+      const unsubLeaves = onSnapshot(leavesCollection, (snapshot) => {
+        if (!snapshot.empty) {
+          const allLeaves = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          setLeaves(allLeaves.filter((l: any) => l.techId === tech.id));
+        } else {
+          setLeaves([]);
         }
-      });
+      }, (err) => console.warn('Leaves sync note:', err));
       
-      // 1. Cloud Firestore listener for technician's assigned tasks
+      // Cloud Firestore listener for technician's assigned tasks
       const unsubFsComp = onSnapshot(complaintsCollection, (snapshot) => {
         if (!snapshot.empty) {
           const fsData = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -108,41 +107,23 @@ function InnerTechnicianDashboard() {
             return merged.sort((a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
           });
         }
-      }, () => {});
-
-      // 2. Also listen to RTDB if active
-      let unsubComp = () => {};
-      try {
-        const compRef = ref(rtdb, 'complaints');
-        unsubComp = onValue(compRef, (snapshot) => {
-          if (snapshot.exists()) {
-            const val = snapshot.val();
-            const rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] }));
-            const rtdbTasks = rtdbData.filter((c: any) => c.assignedTechnicianId === tech.id);
-            setComplaints(prev => {
-              const merged = [...rtdbTasks, ...prev];
-              return [...new Map(merged.map(item => [item.id, item])).values()].sort((a: any, b: any) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-            });
-          }
-        }, () => {});
-      } catch(e) {}
+      }, (err) => console.warn('Complaints sync note:', err));
       
-      const invRef = ref(rtdb, 'inventory');
-      const unsubInv = onValue(invRef, (snapshot) => {
-         if (snapshot.exists()) {
-           const val = snapshot.val();
-           setInventory(Object.keys(val).map(key => ({ id: key, ...val[key] })));
-         } else {
-           setInventory([]);
-         }
-      });
+      const unsubInv = onSnapshot(inventoryCollection, (snapshot) => {
+        if (!snapshot.empty) {
+          const val = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as InventoryItem[];
+          setInventory(val);
+        } else {
+          setInventory([]);
+        }
+      }, (err) => console.warn('Inventory sync note:', err));
 
       return () => {
         unsubAtt();
         unsubLeaves();
-        unsubComp();
+        unsubFsComp();
         unsubInv();
-      }
+      };
     }
   }, [tech]);
 
@@ -179,10 +160,11 @@ function InnerTechnicianDashboard() {
             photoUrl: dataUrl,
             timestamp: new Date().toISOString()
           };
-          import('firebase/database').then(({set, ref}) => {
-            set(ref(rtdb, 'attendance/' + newRecord.id), newRecord).then(() => {
-               alert('Check-in successful!');
-            });
+          setDoc(doc(db, 'attendance', newRecord.id), newRecord).then(() => {
+            alert('Check-in successful!');
+          }).catch(err => {
+            console.error('Error recording check-in:', err);
+            alert('Failed to record check-in.');
           });
         }
         setShowSelfieCamera(false);
@@ -209,10 +191,11 @@ function InnerTechnicianDashboard() {
         status: 'Pending',
         timestamp: new Date().toISOString()
      };
-     import('firebase/database').then(({set, ref}) => {
-        set(ref(rtdb, 'leaves/' + newLeave.id), newLeave).then(() => {
-           alert("Leave request submitted to Admin.");
-        });
+     setDoc(doc(db, 'leaves', newLeave.id), newLeave).then(() => {
+        alert("Leave request submitted to Admin.");
+     }).catch(err => {
+        console.error("Error submitting leave request:", err);
+        alert("Failed to submit leave request.");
      });
   };
   const [isOnShift, setIsOnShift] = useState(false);
@@ -235,12 +218,11 @@ function InnerTechnicianDashboard() {
         }
       }
 
-      // Also sync from Firebase attendance node
+      // Also sync from Firebase attendance document
       try {
-        const attRef = ref(rtdb, `attendance/${tech.id}`);
-        get(attRef).then((snapshot) => {
+        getDoc(doc(db, 'attendance', tech.id)).then((snapshot) => {
           if (snapshot.exists()) {
-            const data = snapshot.val();
+            const data = snapshot.data();
             if (data.isOnShift && data.shiftStartTimeMs) {
               const now = Date.now();
               if (now - data.shiftStartTimeMs < 24 * 60 * 60 * 1000) {
@@ -283,23 +265,15 @@ function InnerTechnicianDashboard() {
         setShiftStartTime(null);
         secureStorage.setItem(`shift_${tech?.id}`, { isOnShift: false, startTime: null });
 
-        // Safely log End Shift to Firebase
+        // Safely log End Shift to Firebase Firestore
         try {
-          const attRef = ref(rtdb, `attendance/${tech.id}`);
-          await update(attRef, {
+          await setDoc(doc(db, 'attendance', tech.id), {
             status: 'Off Shift',
             isOnShift: false,
             lastShiftEnd: endIso,
             lastShiftDurationSec: duration,
             updatedAt: endIso
-          });
-          const logsRef = ref(rtdb, `attendance/${tech.id}/logs`);
-          await push(logsRef, {
-            action: 'End Shift',
-            timestamp: endIso,
-            durationSeconds: duration,
-            formattedDuration: formatDuration(duration)
-          });
+          }, { merge: true });
         } catch (err) {
           console.error('Error logging End Shift to Firebase:', err);
         }
@@ -313,10 +287,9 @@ function InnerTechnicianDashboard() {
       setShiftStartTime(now);
       secureStorage.setItem(`shift_${tech?.id}`, { isOnShift: true, startTime: now });
 
-      // Safely log Start Shift to Firebase
+      // Safely log Start Shift to Firebase Firestore
       try {
-        const attRef = ref(rtdb, `attendance/${tech.id}`);
-        await update(attRef, {
+        await setDoc(doc(db, 'attendance', tech.id), {
           techId: tech.id,
           techName: tech.name,
           techPhone: tech.phone || tech.mobile || '',
@@ -326,13 +299,7 @@ function InnerTechnicianDashboard() {
           shiftStartTimeMs: now,
           date: todayDate,
           updatedAt: nowIso
-        });
-        const logsRef = ref(rtdb, `attendance/${tech.id}/logs`);
-        await push(logsRef, {
-          action: 'Start Shift',
-          timestamp: nowIso,
-          date: todayDate
-        });
+        }, { merge: true });
       } catch (err) {
         console.error('Error logging Start Shift to Firebase:', err);
       }
@@ -359,43 +326,40 @@ function InnerTechnicianDashboard() {
     if (storedTech) {
       const techData = JSON.parse(storedTech);
       setTech(techData);
-      
-      
     }
   }, []);
-
-  
-
-  
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setLoginError('');
     try {
-      const activeTechs = safeJSONParse(localStorage.getItem('app_active_technicians'), JSON.parse('[]'));
-      const foundTech = activeTechs?.find((t: any) => 
-        (t.phone === phone || t.loginId === phone || t.mobile === phone) && 
-        t.password === password
+      const snap = await getDocs(techniciansCollection);
+      let allTechs: any[] = [];
+      if (!snap.empty) {
+        allTechs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      }
+      const cleanPhone = phone.trim();
+      const cleanPassword = password.trim();
+      const foundTech = allTechs.find((t: any) => 
+        (t.phone === cleanPhone || t.loginId === cleanPhone || t.mobile === cleanPhone) && 
+        t.password === cleanPassword
       );
 
       if (!foundTech) {
-        setLoginError('Invalid credentials');
+        setLoginError('Invalid credentials. Please verify your registered mobile number and password.');
       } else if (foundTech.isActive === false) {
         setLoginError('Account inactive. Contact Admin.');
       } else {
         setTech(foundTech);
         localStorage.setItem('current_tech', JSON.stringify(foundTech));
-        
-        
       }
-    } catch (error) {
-      setLoginError('Error logging in');
+    } catch (error: any) {
+      console.error('Technician login error:', error);
+      setLoginError('Error logging in: ' + (error?.message || 'Check connection'));
     }
     setLoading(false);
   };
-
-  
 
   const handleLogout = () => {
     localStorage.removeItem('current_tech');
@@ -415,13 +379,13 @@ function InnerTechnicianDashboard() {
         status: remarkStatus,
         updatedAt: new Date().toISOString()
       };
-      updateDoc(doc(db, 'complaints', remarkingComplaintId), remarkData).catch(() => {});
-      update(ref(rtdb, 'complaints/' + remarkingComplaintId), remarkData).catch(() => {});
+      await updateDoc(doc(db, 'complaints', remarkingComplaintId), remarkData);
       setRemarkModalOpen(false);
       setRemarkingComplaintId(null);
       setTechnicianRemark('');
       setRemarkStatus('Pending - Part Required');
-    } catch (error) {
+      alert('Remark saved successfully!');
+    } catch (error: any) {
       console.error('Error saving remark:', error);
       alert('Failed to save remark. Please try again.');
     }
@@ -450,12 +414,11 @@ function InnerTechnicianDashboard() {
             utrNumber: DOMPurify.sanitize(utrNumber),
             paymentScreenshotUrl
           })
-        }
+        },
+        updatedAt: new Date().toISOString()
       };
 
-      updateDoc(doc(db, 'complaints', resolvingComplaintId), resolveData).catch(() => {});
-      const complaintRef = ref(rtdb, 'complaints/' + resolvingComplaintId);
-      update(complaintRef, resolveData).catch(() => {});
+      await updateDoc(doc(db, 'complaints', resolvingComplaintId), resolveData);
       
       setResolutionModalOpen(false);
       setResolvingComplaintId(null);
@@ -468,6 +431,9 @@ function InnerTechnicianDashboard() {
       setTotalCost('');
       setPaymentStatus('Paid');
       setPaymentMethod('Cash');
+      setUtrNumber('');
+      setPaymentScreenshotUrl('');
+      alert('Job marked as completed successfully!');
       setUtrNumber('');
       setPaymentScreenshotUrl('');
       
@@ -598,20 +564,24 @@ function InnerTechnicianDashboard() {
 
   const handleViewHistory = async (phone: string) => {
     try {
-      const snapshot = await get(ref(rtdb, 'complaints'));
-      if (snapshot.exists()) {
-         const data = snapshot.val();
-         const allComplaints = Object.keys(data).map(k => ({ id: k, ...data[k] }));
-         
-         const userHistory = allComplaints.filter(c => c.phone === phone);
-         userHistory.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-         setCustomerHistory(userHistory);
+      const snapshot = await getDocs(complaintsCollection);
+      if (!snapshot.empty) {
+        const allComplaints = snapshot.docs.map(k => ({ id: k.id, ...k.data() })) as Complaint[];
+        const cleanTarget = phone.replace(/[^0-9]/g, '').slice(-10);
+        const userHistory = allComplaints.filter(c => {
+          const cPhone = (c.phone || (c as any).mobile || '').replace(/[^0-9]/g, '').slice(-10);
+          return cPhone && cPhone === cleanTarget;
+        });
+        userHistory.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setCustomerHistory(userHistory);
+      } else {
+        setCustomerHistory([]);
       }
 
       setHistoryPhone(phone);
       setHistoryModalOpen(true);
     } catch (error) {
-      console.error("Error fetching history:", error);
+      console.error("Error fetching history from Firestore:", error);
       alert("Failed to load customer history.");
     }
   };
@@ -987,6 +957,23 @@ function InnerTechnicianDashboard() {
                       )}
                     </div>
                     
+                    {complaint?.technicianAlert && (
+                      <div className="bg-blue-50 p-3 rounded-lg border border-blue-200">
+                        <p className="text-xs text-blue-800 uppercase tracking-wider font-bold mb-1 flex items-center gap-1.5">
+                          <Wrench className="w-3.5 h-3.5 text-blue-600" />
+                          Area Admin Alert ({complaint.technicianAlert.alertStatus || 'Assigned'})
+                        </p>
+                        <p className="text-xs text-blue-900 font-medium">
+                          Dispatched by: <span className="font-bold">{complaint.technicianAlert.areaAdminName || 'Area Admin'}</span>
+                        </p>
+                        {complaint.technicianAlert.note && (
+                          <p className="text-xs text-blue-800 mt-1 italic bg-white/70 p-2 rounded border border-blue-100">
+                            "{complaint.technicianAlert.note}"
+                          </p>
+                        )}
+                      </div>
+                    )}
+
                     {complaint?.technicianRemark && (
                       <div className="bg-yellow-50 p-3 rounded-lg border border-yellow-100">
                         <p className="text-xs text-yellow-800 uppercase tracking-wider font-semibold mb-1 flex items-center gap-1">

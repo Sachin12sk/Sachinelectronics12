@@ -1,6 +1,5 @@
-import { ref, onValue, set } from 'firebase/database';
-import { getDocs } from 'firebase/firestore';
-import { rtdb, productsCollection } from '../lib/firebase';
+import { doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { db, productsCollection } from '../lib/firebase';
 import { ShoppingCart, X, CheckCircle2, Search, Box, Camera, ChevronLeft, ChevronRight, Sparkles, Wrench, Package, Copy, Check, MessageCircle, ExternalLink, ShieldCheck, ArrowRight } from 'lucide-react';
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -54,26 +53,26 @@ export default function Shop() {
   const carouselRef = useRef<HTMLDivElement>(null);
   const searchInputBoxRef = useRef<HTMLDivElement>(null);
 
-  // Realtime Firebase Sync: Fetch product data live using onValue(ref(db, 'products'), snapshot => ...)
+  // Realtime Cloud Firestore Sync for Products
   useEffect(() => {
     let isMounted = true;
-    const db = rtdb;
-    const productsRef = ref(db, 'products');
-    const unsubscribe = onValue(
-      productsRef,
+    const unsubscribe = onSnapshot(
+      productsCollection,
       (snapshot) => {
         if (!isMounted) return;
-        if (snapshot.exists()) {
-          const data = snapshot.val();
-          const liveProducts = Object.keys(data).map((k) => ({
-            id: k,
-            ...data[k],
+        if (!snapshot.empty) {
+          const fsProducts = snapshot.docs.map((doc) => ({
+            id: doc.id,
+            ...doc.data(),
           })) as Product[];
-          if (liveProducts.length > 0) {
-            setProducts(liveProducts);
-          } else {
-            setProducts(defaultProducts);
-          }
+          // Merge with defaultProducts so essential catalog spare parts are never lost
+          const existingIds = new Set(fsProducts.map(p => p.id));
+          const existingNames = new Set(fsProducts.map(p => p.name.trim().toLowerCase()));
+          const combined = [
+            ...fsProducts,
+            ...defaultProducts.filter(p => !existingIds.has(p.id) && !existingNames.has(p.name.trim().toLowerCase()))
+          ];
+          setProducts(combined);
         } else {
           setProducts(defaultProducts);
         }
@@ -81,28 +80,9 @@ export default function Shop() {
       },
       (error: any) => {
         if (!isMounted) return;
-        console.warn('Realtime Database products sync note:', error?.message || error);
-        
-        // Fallback: try fetching from Cloud Firestore products collection
-        getDocs(productsCollection)
-          .then((snapshot) => {
-            if (!isMounted) return;
-            if (!snapshot.empty) {
-              const fsProducts = snapshot.docs.map((doc) => ({
-                id: doc.id,
-                ...doc.data(),
-              })) as Product[];
-              setProducts(fsProducts.length > 0 ? fsProducts : defaultProducts);
-            } else {
-              setProducts(defaultProducts);
-            }
-          })
-          .catch((_fsErr) => {
-            if (isMounted) setProducts(defaultProducts);
-          })
-          .finally(() => {
-            if (isMounted) setLoading(false);
-          });
+        console.warn('Cloud Firestore products sync note:', error?.message || error);
+        setProducts(defaultProducts);
+        setLoading(false);
       }
     );
 
@@ -274,8 +254,21 @@ export default function Shop() {
     };
 
     try {
-      // 1. Save in Firebase Realtime Database under ref(rtdb, 'orders/' + orderId)
-      await set(ref(rtdb, `orders/${cleanOrderId}`), sanitizeForFirebase(newOrder));
+      // 1. Save in Cloud Firestore under orders collection
+      const orderDocRef = doc(db, 'orders', cleanOrderId);
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<void>((resolve) => {
+        timeoutId = setTimeout(() => {
+          console.warn("Firestore order server acknowledgment taking longer; background synchronization is active.");
+          resolve();
+        }, 8000);
+      });
+
+      await Promise.race([
+        setDoc(orderDocRef, sanitizeForFirebase(newOrder)),
+        timeoutPromise
+      ]);
+      if (timeoutId) clearTimeout(timeoutId);
 
       // 2. Persist to recent orders list in localStorage
       try {
@@ -287,7 +280,7 @@ export default function Shop() {
         console.warn('Could not update recent orders in localStorage', err);
       }
     } catch (firebaseErr) {
-      console.error('Error saving order to Firebase:', firebaseErr);
+      console.error('Error saving order to Firestore:', firebaseErr);
     }
 
     let exchangeText = '';

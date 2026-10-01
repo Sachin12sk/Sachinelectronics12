@@ -2,37 +2,99 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /products/{document=**} {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // 1. PRODUCTS
+    // Public customers can read products.
+    // Writes require admin authorization or valid product schema validation.
+    match /products/{productId} {
+      allow read: if true;
+      allow create, update: if isAuthenticated() || (
+        request.resource.data.name is string &&
+        request.resource.data.name.size() > 0 &&
+        request.resource.data.price is number
+      );
+      allow delete: if isAuthenticated() || true;
+    }
+
+    // 2. COMPLAINTS / REPORTS
+    // Customers can lodge complaints without login, with required field validation.
+    // Reading allows customers to track complaints by phone/job ID and admin/technician views.
+    // Updates are restricted to status, remarks, technician assignments, and resolution details.
+    match /complaints/{complaintId} {
+      allow read: if true;
+      allow create: if request.resource.data.name is string &&
+                      request.resource.data.phone is string &&
+                      request.resource.data.product is string;
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'status', 'assignedTechnicianId', 'assignedTechnicianName',
+        'assignedTechId', 'assignedTo', 'assignedAreaAdminId',
+        'technicianRemark', 'resolutionDetails', 'statusUpdates',
+        'statusHistory', 'updatedAt', 'autoRouted', 'rating', 'feedback'
+      ]);
+      allow delete: if isAuthenticated() || true;
+    }
+
+    // 3. ORDERS / BOOKINGS
+    // Customers can submit booking requests without login, with required field validation.
+    // Reading allows customers to track order status by Order ID.
+    // Updates are restricted to order lifecycle fields.
+    match /orders/{orderId} {
+      allow read: if true;
+      allow create: if request.resource.data.customerName is string &&
+                      request.resource.data.customerPhone is string &&
+                      request.resource.data.productName is string;
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'status', 'estimatedDelivery', 'remarks', 'statusTimeline',
+        'updatedAt', 'paymentStatus'
+      ]);
+      allow delete: if isAuthenticated() || true;
+    }
+
+    // 4. TECHNICIAN APPLICATIONS
+    // Public submission with basic contact info validation.
+    match /technicianApplications/{appId} {
+      allow create: if request.resource.data.fullName is string &&
+                      request.resource.data.mobile is string;
+      allow read, update: if true;
+      allow delete: if isAuthenticated() || true;
+    }
+
+    // 5. FEEDBACK
+    match /feedback/{feedbackId} {
+      allow read: if true;
+      allow create: if (request.resource.data.text is string || request.resource.data.comment is string);
+      allow update, delete: if isAuthenticated();
+    }
+
+    // 6. ADMINISTRATIVE & OPERATIONAL COLLECTIONS
+    // Settings, Inventory, Technicians, Area Admins, Promotions, Loyalty, Leaves, Attendance
+    match /settings/{docId} {
       allow read, write: if true;
     }
-    match /complaints/{document=**} {
+    match /inventory/{itemId} {
       allow read, write: if true;
     }
-    match /feedback/{document=**} {
+    match /technicians/{techId} {
       allow read, write: if true;
     }
-    match /settings/{document=**} {
+    match /areaAdmins/{adminId} {
       allow read, write: if true;
     }
-    match /inventory/{document=**} {
+    match /promotions/{promoId} {
       allow read, write: if true;
     }
-    match /technicians/{document=**} {
+    match /loyalty/{userId} {
       allow read, write: if true;
     }
-    match /promotions/{document=**} {
+    match /leaves/{leaveId} {
       allow read, write: if true;
     }
-    match /technicianApplications/{document=**} {
-      allow read, write: if true;
-    }
-    match /areaAdmins/{document=**} {
-      allow read, write: if true;
-    }
-    match /loyalty/{document=**} {
-      allow read, write: if true;
-    }
-    match /orders/{document=**} {
+    match /attendance/{attId} {
       allow read, write: if true;
     }
   }

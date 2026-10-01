@@ -1,10 +1,7 @@
-import { rtdb } from '../lib/firebase';
-import { ref, get } from 'firebase/database';
-import { getDocs } from 'firebase/firestore';
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { db, promotionsCollection } from '../lib/firebase';
-
+import { getDocs } from 'firebase/firestore';
+import { promotionsCollection } from '../lib/firebase';
 import { Promotion } from '../types';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 
@@ -16,26 +13,14 @@ export default function HeroCarousel() {
     let isMounted = true;
     const fetchPromotions = async () => {
       try {
-        const snapshot = await get(ref(rtdb, 'promotions'));
-        let activePromos: Promotion[] = [];
-        if (snapshot.exists()) {
-          const data = snapshot.val();
-          activePromos = Object.keys(data).map(k => ({ id: k, ...data[k] })).filter(p => p.isActive) as Promotion[];
+        const fsSnap = await getDocs(promotionsCollection);
+        if (!fsSnap.empty && isMounted) {
+          const activePromos = fsSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter((p: any) => p.isActive) as Promotion[];
           activePromos.sort((a, b) => a.order - b.order);
+          setPromotions(activePromos);
         }
-        if (isMounted) setPromotions(activePromos);
       } catch (error: any) {
-        console.warn('RTDB promotions sync notice:', error?.message || error);
-        try {
-          const fsSnap = await getDocs(promotionsCollection);
-          if (!fsSnap.empty && isMounted) {
-            const activePromos = fsSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter((p: any) => p.isActive) as Promotion[];
-            activePromos.sort((a, b) => a.order - b.order);
-            setPromotions(activePromos);
-          }
-        } catch (_fsErr) {
-          // ignore fallback error
-        }
+        console.warn('Firestore promotions fetch note:', error?.message || error);
       }
     };
     

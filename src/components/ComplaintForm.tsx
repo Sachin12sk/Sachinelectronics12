@@ -1,16 +1,15 @@
 // force refresh
-import { ref, push, set, get, onValue } from 'firebase/database';
 import React, { useState, useEffect } from 'react';
 import { CheckCircle2, AlertCircle, Search, Clock, Wrench, Download, ImagePlus, X, Camera, MapPin, Navigation } from 'lucide-react';
 import { motion } from 'motion/react';
-import { rtdb, complaintsCollection, settingsCollection, db, areaAdminsCollection, loyaltyCollection } from '../lib/firebase';
-import { collection, addDoc, doc, getDoc, getDocs, query, where, onSnapshot } from 'firebase/firestore';
+import { complaintsCollection, settingsCollection, db, areaAdminsCollection, loyaltyCollection } from '../lib/firebase';
+import { collection, addDoc, setDoc, doc, getDoc, getDocs, query, where, onSnapshot } from 'firebase/firestore';
 
 import { Complaint, ServiceRate } from '../types';
 import { generateInvoice } from '../utils/generateInvoice';
 import DOMPurify from 'dompurify';
+import { isValidFile, normalizePincode } from '../lib/security';
 import VoiceInput from './VoiceInput';
-import { isValidFile } from '../lib/security';
 import complaintBgImg from '../assets/images/complaint_background_1785441977801.jpg';
 
 function safeJSONParse(val: string | null, fallback: any) {
@@ -51,48 +50,30 @@ export default function ComplaintForm() {
 
   
   useEffect(() => {
-    // 1. Listen to pricing from Cloud Firestore (primary)
+    // Listen to pricing from Cloud Firestore (primary)
     const unsubFirestorePricing = onSnapshot(doc(db, 'settings', 'pricing'), (snap) => {
       if (snap.exists()) {
         const data = snap.data();
         setPricing(prev => ({
           ...prev,
           ...data,
-          serviceFees: { ...prev.serviceFees, ...(data.serviceFees || {}) }
+          serviceFees: { ...prev.serviceFees, ...(data?.serviceFees || {}) }
         }));
       }
     }, (err) => {
       console.warn("Firestore pricing sync note:", err?.message || err);
     });
 
-    // 2. Also listen to RTDB pricing as secondary
-    let unsubPricing = () => {};
-    try {
-      unsubPricing = onValue(ref(rtdb, 'settings/pricing'), (snapshot) => {
-        if (snapshot.exists()) {
-          const data = snapshot.val();
-          setPricing(prev => ({ ...prev, ...data, serviceFees: { ...prev.serviceFees, ...(data.serviceFees || {}) } }));
-        }
-      }, () => {});
-    } catch (e) {}
-
-    // 3. Service rates from RTDB or fallback
-    let unsubServiceRates = () => {};
-    try {
-      unsubServiceRates = onValue(ref(rtdb, 'serviceRates'), (snapshot) => {
-        if (snapshot.exists()) {
-          const data = snapshot.val();
-          setServiceRates(Object.keys(data).map(key => ({ id: key, ...data[key] })));
-        } else {
-          setServiceRates([]);
-        }
-      }, () => {});
-    } catch (e) {}
+    const unsubFirestoreRates = onSnapshot(doc(db, 'settings', 'serviceRates'), (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        setServiceRates(data?.rates || []);
+      }
+    }, () => {});
 
     return () => {
       unsubFirestorePricing();
-      unsubPricing();
-      unsubServiceRates();
+      unsubFirestoreRates();
     };
   }, []);
 
@@ -126,19 +107,6 @@ export default function ComplaintForm() {
       } catch (fsErr) {
         console.warn("Firestore loyalty lookup note:", fsErr);
       }
-
-      // 2. Fallback to RTDB
-      try {
-        const snap = await get(ref(rtdb, 'loyalty'));
-        if (snap.exists()) {
-          const allLoyalty = snap.val();
-          const matchKey = Object.keys(allLoyalty).find(k => allLoyalty[k].phone === cleanPhone || allLoyalty[k].phone === phoneNumber);
-          if (matchKey) {
-            setLoyaltyCoins(allLoyalty[matchKey].coins || 0);
-            return;
-          }
-        }
-      } catch (e) {}
 
       setLoyaltyCoins(0);
     } catch (e) {
@@ -223,50 +191,53 @@ export default function ComplaintForm() {
       const discount = applyCoins ? Math.floor(loyaltyCoins / 10) : 0;
       const estTotal = Math.max(0, pricing.homeVisitCharge + serviceFee - discount);
 
-      const newComplaintData: Record<string, any> = {
+      // 2. Primary Save: Cloud Firestore collection 'complaints'
+      const newDocRef = doc(complaintsCollection);
+      const newComplaintId = newDocRef.id;
+
+      const cleanComplaintData: Record<string, any> = {
+        id: newComplaintId,
+        jobCardId: newComplaintId.substring(0, 8).toUpperCase(),
         assignedAreaAdminId: assignedAreaAdminId || null,
         autoRouted: !!assignedAreaAdminId,
-        name,
-        phone: phoneInput,
-        pincode: finalPincode,
-        address: addressInput,
-        product,
-        issue,
+        name: name.trim(),
+        phone: phoneInput.trim(),
+        mobile: phoneInput.trim(),
+        pincode: finalPincode.trim(),
+        address: addressInput.trim(),
+        product: product.trim(),
+        device: product.trim(),
+        appliance: product.trim(),
+        issue: issue.trim(),
         priority,
         timeslot,
         status: 'Pending',
         createdAt: new Date().toISOString(),
-        serviceFee,
-        discount,
-        estTotal,
+        serviceFee: Number(serviceFee) || 0,
+        discount: Number(discount) || 0,
+        estTotal: Number(estTotal) || 0,
         ...(issueImage && { issueImageUrl: issueImage })
       };
 
-      // 2. Primary Save: Cloud Firestore with a 15-second safety timeout
-      const firestoreWritePromise = addDoc(collection(db, 'complaints'), newComplaintData);
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => {
-          reject(new Error('Database write timed out. Please check your internet connection and try again.'));
-        }, 15000);
-      });
-
-      const docRef = await Promise.race([firestoreWritePromise, timeoutPromise]);
-      const newComplaintId = docRef.id;
-
-      // 3. Fire-and-forget background sync to RTDB if active (non-blocking)
       try {
-        const complaintsListRef = ref(rtdb, 'complaints/' + newComplaintId);
-        set(complaintsListRef, newComplaintData).catch(() => {});
-      } catch (e) {}
+        await setDoc(newDocRef, cleanComplaintData);
+      } catch (writeErr: any) {
+        console.error("=== FIREBASE WRITE ERROR DIAGNOSTIC ===");
+        console.error("Firebase error code:", writeErr?.code);
+        console.error("Firebase error message:", writeErr?.message);
+        console.error("Firebase error name:", writeErr?.name);
+        console.error("Firebase full error object:", writeErr);
+        throw writeErr;
+      }
 
-      // 4. Update local storage for optimistic immediate display in tracking/admin
+      // 3. Update local storage for optimistic immediate display in tracking
       try {
         const stored = safeJSONParse(localStorage.getItem('app_complaints'), []);
-        const updated = [{ id: newComplaintId, ...newComplaintData }, ...stored];
+        const updated = [{ id: newComplaintId, ...cleanComplaintData }, ...stored];
         localStorage.setItem('app_complaints', JSON.stringify(updated));
       } catch (e) {}
 
-      // 5. Success state
+      // 4. Success state
       setIsSubmitting(false);
       setIsSuccess(true);
       setSuccessJobId(newComplaintId);
@@ -296,10 +267,17 @@ export default function ComplaintForm() {
       setApplyCoins(false);
 
     } catch (error: any) {
-      console.error("Error submitting report:", error);
+      console.error("=== FORM SUBMISSION ERROR ===");
+      console.error("Firebase error code:", error?.code || "none");
+      console.error("Firebase error message:", error?.message || String(error));
+      console.error("Firebase error name:", error?.name || "Error");
+      console.error("Firebase full error object:", error);
       setIsSubmitting(false);
-      // Keep user input intact and display the actual useful error message
-      setErrorMessage(error?.message || "Failed to submit report. Please check your network and try again.");
+      // Display the actual error code and message without generic obfuscation
+      const displayMsg = error?.code 
+        ? `Firebase Error [${error.code}]: ${error.message || 'Unknown error'}`
+        : (error?.message || "Failed to submit report. Please check your network and try again.");
+      setErrorMessage(displayMsg);
     }
   };
 
@@ -327,23 +305,7 @@ export default function ComplaintForm() {
         console.warn('Firestore tracking fetch error', fsErr);
       }
 
-      // 2. Merge with RTDB if available
-      try {
-        const snapshot = await get(ref(rtdb, 'complaints'));
-        if (snapshot.exists()) {
-          const val = snapshot.val();
-          const rtdbData = Object.keys(val).map(key => ({ id: key, ...val[key] })) as Complaint[];
-          const remoteComplaints = rtdbData.filter((c: any) => {
-            const cPhone = String(c.phone || c.mobile || '').replace(/[^0-9]/g, '');
-            const cId = String(c.id || '').toLowerCase();
-            return cPhone.endsWith(cleanSearch) || cPhone === cleanSearch || cId === cleanSearch;
-          });
-          const all = [...complaints, ...remoteComplaints];
-          complaints = [...new Map(all.map(item => [item.id, item])).values()];
-        }
-      } catch (e) {}
-
-      // 3. Merge with local storage fallback
+      // 2. Merge with local storage fallback
       try {
         const local = safeJSONParse(localStorage.getItem('app_complaints'), []);
         const localMatches = local.filter((c: any) => {
